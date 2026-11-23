@@ -3151,6 +3151,43 @@ int main() {
     test_experts_rdna();
 #endif
     test_window_exact(p.major >= 8);
+    // (IK2_TUNE: the same quantised suites with the dots fused - the change is rounding, so these are the tolerances it
+    //  has to stay inside; the engine's own path stays the gate above)
+    k::set_tune_fma(1);
+    std::printf("-- with IK2_TUNE=1's fused dots --\n");
+    test_decode();
+    test_iq_ref();
+    test_experts_mv();
+    test_mv_blocks();
+    test_experts_grouped();
+    test_round6();
+    test_token_path();
+    test_experts_mma();
+    k::set_tune_fma(0);
+    // (IK2_E4LUT: the constant table against the bit-decode it replaces - all 256 entries, bit for bit.  This is what
+    //  makes the flag byte-identical by construction rather than by hope.)
+    {
+        std::vector<unsigned> off(256), on(256);
+        unsigned* d = nullptr;
+        CU(cudaMalloc(&d, 256 * sizeof(unsigned)));
+        k::set_e4lut(0);
+        k::e4lut_probe(d);
+        CU(cudaMemcpy(off.data(), d, 256 * sizeof(unsigned), cudaMemcpyDeviceToHost));
+        k::set_e4lut(1);
+        k::e4lut_probe(d);
+        CU(cudaMemcpy(on.data(), d, 256 * sizeof(unsigned), cudaMemcpyDeviceToHost));
+        int ours = 0;
+        unsigned first = 0;
+        for (int i = 0; i < 256; ++i)
+            if (off[i] != on[i] && !ours++) first = (unsigned) i;
+        const bool same = ours == 0;
+        std::printf("%s %-34s %d entries, %s\n", same ? "ok  " : "FAIL", "NVFP4 scale LUT = the bit-decode", 256,
+                    same ? "bit for bit" : "DIFFER");
+        if (!same) std::printf("      first at 0x%02x: %08x against %08x\n", first, off[first], on[first]);
+        g_fail += same ? 0 : 1;
+        CU(cudaFree(d));
+        k::set_e4lut(0);
+    }
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

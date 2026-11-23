@@ -2531,6 +2531,17 @@ __host__ __device__ __forceinline__ float ue4m3(uint8_t x) {   // ggml_ue4m3_to_
     const float v = (e == 0u) ? sub_f : norm_f;
     return (x == 0x7Fu) ? 0.0f : v;
 }
+// (IK2_E4LUT: the same 256 values in the constant bank, so a sub-block's scale is one uniform load instead of five
+//  integer ops and a branch.  Filled from ue4m3() itself (set_e4lut below), so the table cannot drift from the decode;
+//  the kernel test asserts all 256 entries equal, which is what makes IK2_E4LUT=1 byte-identical by construction.)
+__constant__ float c_e4m3[256];
+__constant__ int g_e4lut = 0;
+__device__ __forceinline__ float ue4m3x(uint8_t x) { return g_e4lut ? c_e4m3[x] : ue4m3(x); }
+__global__ void e4lut_probe_kernel(unsigned* out) {   // (the 256 values the dot would read, as bits: the test's check)
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < 256) out[i] = __float_as_uint(ue4m3x((uint8_t) i));
+}
+
 // IQ3_XXS / IQ4_XS tables: ggml's (ik2_iq_tables.h), the device copy read with __ldg, the host copy on the host.
 __host__ __device__ __forceinline__ uint32_t iq3xxs_grid_at(int i) {
 #ifdef __CUDA_ARCH__
@@ -2758,6 +2769,14 @@ __host__ __device__ constexpr size_t xp_floats(int K) {
     return K <= 0 ? 0 : (size_t) ((K - 1) >> 5) * 36 + ((K - 1) & 31) + 1;
 }
 
+// (IK2_TUNE: the dequantised dots as fused multiply-adds.  The dots below are written as sums of products - a*x + b*y +
+//  ... - which keeps every product's rounding separate and costs an add a term.  A term fused into the next (fmaf)
+//  drops that add and keeps the product's own 24-bit value, so a dot of hundreds of terms lands a few ulp from the
+//  engine's sum: the answers move, the formats do not.  Off (the default) the engine's own expressions run, to the
+//  bit.  Set once from the host (set_tune_fma); a __constant__ read the compiler hoists out of the loops.)
+__constant__ int g_tune_fma = 0;
+__device__ __forceinline__ bool tune_fma() { return g_tune_fma != 0; }
+
 // Fast register E2M1 pair decode via FP16 high-byte LUT in __byte_perm -> __half22float2:
 // FP16 representations of {0, 1, 2, 3, 4, 6, 8, 12} all have low byte 0x00 and high bytes {0x00, 0x3c, 0x40, 0x42, 0x44, 0x46, 0x48, 0x4a}.
 __device__ __forceinline__ float2 e2m1_pair_lo(uint32_t s) {
@@ -2771,7 +2790,21 @@ __device__ __forceinline__ float2 e2m1_pair_hi(uint32_t s) {
     return u32_to_f2(__byte_perm(0x42403c00u, 0x4a484644u, sel) | sgn);
 }
 
+__device__ __forceinline__ float nvfp4_sub_dot_fma(uint32_t q0, uint32_t q1, float4 x0, float4 x1, float4 x2,
+                                                   float4 x3) {
+    const float2 w01 = e2m1_pair_lo(q0), w23 = e2m1_pair_lo(q0 >> 16);
+    const float2 w45 = e2m1_pair_lo(q1), w67 = e2m1_pair_lo(q1 >> 16);
+    const float2 w89 = e2m1_pair_hi(q0), wAB = e2m1_pair_hi(q0 >> 16);
+    const float2 wCD = e2m1_pair_hi(q1), wEF = e2m1_pair_hi(q1 >> 16);
+    // (four chains of four, one multiply to start each: the same products, each sum fused into its term)
+    const float a = fmaf(w23.y, x0.w, fmaf(w23.x, x0.z, fmaf(w01.y, x0.y, w01.x * x0.x)));
+    const float b = fmaf(w67.y, x1.w, fmaf(w67.x, x1.z, fmaf(w45.y, x1.y, w45.x * x1.x)));
+    const float c = fmaf(wAB.y, x2.w, fmaf(wAB.x, x2.z, fmaf(w89.y, x2.y, w89.x * x2.x)));
+    const float d = fmaf(wEF.y, x3.w, fmaf(wEF.x, x3.z, fmaf(wCD.y, x3.y, wCD.x * x3.x)));
+    return (a + b) + (c + d);
+}
 __device__ __forceinline__ float nvfp4_sub_dot(uint32_t q0, uint32_t q1, float4 x0, float4 x1, float4 x2, float4 x3) {
+    if (tune_fma()) return nvfp4_sub_dot_fma(q0, q1, x0, x1, x2, x3);
     const float2 w01 = e2m1_pair_lo(q0), w23 = e2m1_pair_lo(q0 >> 16);
     const float2 w45 = e2m1_pair_lo(q1), w67 = e2m1_pair_lo(q1 >> 16);
     const float2 w89 = e2m1_pair_hi(q0), wAB = e2m1_pair_hi(q0 >> 16);
@@ -2782,7 +2815,43 @@ __device__ __forceinline__ float nvfp4_sub_dot(uint32_t q0, uint32_t q1, float4 
            (wCD.x * x3.x + wCD.y * x3.y + wEF.x * x3.z + wEF.y * x3.w);
 }
 
+__device__ __forceinline__ float dot_u32_f4_fma(uint32_t q4, float4 f) {
+    return fmaf((float) (int8_t) (q4 >> 24), f.w,
+                fmaf((float) (int8_t) ((q4 >> 16) & 0xFFu), f.z,
+                     fmaf((float) (int8_t) ((q4 >> 8) & 0xFFu), f.y, (float) (int8_t) (q4 & 0xFFu) * f.x)));
+}
+// (IK2_XGLOBAL: an NVFP4 gate/up row pair with the input read through global memory - L1/L2 - instead of the block's
+//  staged copy in shared memory.  The fork measured this faster on a 3090 (a 128 KB staging write and barrier a block);
+//  on sm_86 the balance is unknown, so it is a toggle for the bench and not a default.  The 16 values of a sub-block are
+//  the same and in the same order as the staged layout (a 32-value group is identity-mapped by xp()), so the products,
+//  their order and the sums are the staged path's: byte-identical by construction, only the loads move.)
+__constant__ int g_xglobal = 0;
+__device__ __forceinline__ void nvfp4_pair_g(const uint8_t* wg, const uint8_t* wu, const float* x, int K, float& og,
+                                             float& ou) {
+    const int lane = threadIdx.x & 31;
+    float ag = 0.0f, au = 0.0f;
+    const int nsub = K / 16;
+    for (int sb = lane; sb < nsub; sb += 32) {
+        const float* xp16 = x + (size_t) sb * 16;
+        const float4 x0 = *(const float4*) (xp16 + 0), x1 = *(const float4*) (xp16 + 4);
+        const float4 x2 = *(const float4*) (xp16 + 8), x3 = *(const float4*) (xp16 + 12);
+        const size_t blk = (size_t) (sb >> 2) * 36;
+        const int sub = sb & 3;
+        const uint8_t* bg = wg + blk;
+        const float dg = ue4m3x((uint8_t) (__ldg((const uint32_t*) bg) >> (8 * sub)));
+        ag += dg * nvfp4_sub_dot(__ldg((const uint32_t*) (bg + 4 + sub * 8)),
+                                 __ldg((const uint32_t*) (bg + 8 + sub * 8)), x0, x1, x2, x3);
+        const uint8_t* bu = wu + blk;
+        const float du = ue4m3x((uint8_t) (__ldg((const uint32_t*) bu) >> (8 * sub)));
+        au += du * nvfp4_sub_dot(__ldg((const uint32_t*) (bu + 4 + sub * 8)),
+                                 __ldg((const uint32_t*) (bu + 8 + sub * 8)), x0, x1, x2, x3);
+    }
+    og = wsum(ag), ou = wsum(au);
+}
+__device__ __forceinline__ bool tune_xglobal() { return g_xglobal != 0; }
+
 __device__ __forceinline__ float dot_u32_f4(uint32_t q4, float4 f) {
+    if (tune_fma()) return dot_u32_f4_fma(q4, f);
     return (float) (int8_t) (q4 & 0xFFu) * f.x +
            (float) (int8_t) ((q4 >> 8) & 0xFFu) * f.y +
            (float) (int8_t) ((q4 >> 16) & 0xFFu) * f.z +
@@ -2817,7 +2886,15 @@ __device__ __forceinline__ float q8_blk1_dot(const uint32_t* p, float d1, float4
 
 // ---- IQ3_XXS / IQ4_XS: one 32-value sub-block against 32 inputs (xv: 8 float4, the padded xs of that sub-block)
 
+__device__ __forceinline__ float sdot4_u8_fma(uint32_t g, uint32_t s, float4 x) {
+    const float w0 = __int_as_float(__float_as_int((float) (g & 0xFFu)) ^ ((s & 1u) << 31));
+    const float w1 = __int_as_float(__float_as_int((float) ((g >> 8) & 0xFFu)) ^ (((s >> 1) & 1u) << 31));
+    const float w2 = __int_as_float(__float_as_int((float) ((g >> 16) & 0xFFu)) ^ (((s >> 2) & 1u) << 31));
+    const float w3 = __int_as_float(__float_as_int((float) (g >> 24)) ^ (((s >> 3) & 1u) << 31));
+    return fmaf(w3, x.w, fmaf(w2, x.z, fmaf(w1, x.y, w0 * x.x)));
+}
 __device__ __forceinline__ float sdot4_u8(uint32_t g, uint32_t s, float4 x) {   // bytes of g, sign bit k of s
+    if (tune_fma()) return sdot4_u8_fma(g, s, x);
     return __int_as_float(__float_as_int((float) (g & 0xFFu) * x.x) ^ ((s & 1u) << 31)) +
            __int_as_float(__float_as_int((float) ((g >> 8) & 0xFFu) * x.y) ^ (((s >> 1) & 1u) << 31)) +
            __int_as_float(__float_as_int((float) ((g >> 16) & 0xFFu) * x.z) ^ (((s >> 2) & 1u) << 31)) +
@@ -3133,7 +3210,7 @@ __device__ float row_dot(int type, const uint8_t* w, const float* xs, int K) {
         for (int sb = lane; sb < nsub; sb += 32) {
             const uint8_t* b = w + (size_t) (sb >> 2) * 36;
             const int sub = sb & 3;
-            const float d = ue4m3((uint8_t) (__ldg((const uint32_t*) b) >> (8 * sub)));
+            const float d = ue4m3x((uint8_t) (__ldg((const uint32_t*) b) >> (8 * sub)));
             const uint32_t q0 = __ldg((const uint32_t*) (b + 4 + sub * 8));
             const uint32_t q1 = __ldg((const uint32_t*) (b + 8 + sub * 8));
             const float* x = xs + (sb >> 1) * 36 + (sb & 1) * 16;
@@ -3271,13 +3348,13 @@ __device__ void row_dot_2(int type, const uint8_t* wg, const uint8_t* wu, const 
             const size_t blk_off = (size_t) (sb >> 2) * 36;
             const int sub = sb & 3;
             const uint8_t* bg = wg + blk_off;
-            const float dg = ue4m3((uint8_t) (__ldg((const uint32_t*) bg) >> (8 * sub)));
+            const float dg = ue4m3x((uint8_t) (__ldg((const uint32_t*) bg) >> (8 * sub)));
             const uint32_t gq0 = __ldg((const uint32_t*) (bg + 4 + sub * 8));
             const uint32_t gq1 = __ldg((const uint32_t*) (bg + 8 + sub * 8));
             ag += dg * nvfp4_sub_dot(gq0, gq1, x0, x1, x2, x3);
 
             const uint8_t* bu = wu + blk_off;
-            const float du = ue4m3((uint8_t) (__ldg((const uint32_t*) bu) >> (8 * sub)));
+            const float du = ue4m3x((uint8_t) (__ldg((const uint32_t*) bu) >> (8 * sub)));
             const uint32_t uq0 = __ldg((const uint32_t*) (bu + 4 + sub * 8));
             const uint32_t uq1 = __ldg((const uint32_t*) (bu + 8 + sub * 8));
             au += du * nvfp4_sub_dot(uq0, uq1, x0, x1, x2, x3);
@@ -3702,8 +3779,12 @@ __global__ void experts_gate_up_swiglu_kernel(const uint8_t* const* blob, const 
                                               const int* orow, int h_ld) {
     extern __shared__ float xs[];
     const int s = blockIdx.y;
-    load_xs_f32(x + (size_t) tok[s] * C, C, xs);
-    __syncthreads();
+    // (IK2_XGLOBAL: an NVFP4 pair reads the input where it is - no staged copy, no barrier - see nvfp4_pair_g)
+    const bool xg = tune_xglobal() && ty_gate == kNVFP4 && ty_up == kNVFP4;
+    if (!xg) {
+        load_xs_f32(x + (size_t) tok[s] * C, C, xs);
+        __syncthreads();
+    }
     const int warp = threadIdx.x >> 5;
     const uint8_t* bl = blob[s];
     const float sgs = sg ? sg[s] : 1.0f;
@@ -3712,7 +3793,9 @@ __global__ void experts_gate_up_swiglu_kernel(const uint8_t* const* blob, const 
         const int r = (blockIdx.x * WARPS + warp) * ROWS + j;
         if (r >= F) break;
         float vg, vu;
-        if (ty_gate == ty_up) {
+        if (xg) {
+            nvfp4_pair_g(bl + (size_t) r * rb_gate, bl + eb0 + (size_t) r * rb_up, x + (size_t) tok[s] * C, C, vg, vu);
+        } else if (ty_gate == ty_up) {
             row_dot_pair(ty_gate, bl + (size_t) r * rb_gate, bl + eb0 + (size_t) r * rb_up, xs, C, vg, vu);
         } else {
             vg = row_dot(ty_gate, bl + (size_t) r * rb_gate, xs, C);
@@ -3830,7 +3913,7 @@ __device__ void row_dot_multi(int type, const uint8_t* w, const X* const* xs, in
         for (int sb = lane; sb < nsub; sb += 32) {
             const uint8_t* b = w + (size_t) (sb >> 2) * 36;
             const int sub = sb & 3;
-            const float d = ue4m3((uint8_t) (*(const uint32_t*) b >> (8 * sub)));
+            const float d = ue4m3x((uint8_t) (*(const uint32_t*) b >> (8 * sub)));
             const uint32_t q0 = *(const uint32_t*) (b + 4 + sub * 8), q1 = *(const uint32_t*) (b + 8 + sub * 8);
             float wv[16];
             decode_nvfp4_wv(q0, q1, wv);
@@ -4045,8 +4128,8 @@ __device__ void row_dot_pair_multi(int type, const uint8_t* wg, const uint8_t* w
             const int sub = sb & 3;
             const uint8_t* bg = wg + blk_off;
             const uint8_t* bu = wu + blk_off;
-            const float dg = ue4m3((uint8_t) (*(const uint32_t*) bg >> (8 * sub)));
-            const float du = ue4m3((uint8_t) (*(const uint32_t*) bu >> (8 * sub)));
+            const float dg = ue4m3x((uint8_t) (*(const uint32_t*) bg >> (8 * sub)));
+            const float du = ue4m3x((uint8_t) (*(const uint32_t*) bu >> (8 * sub)));
             float wvg[16], wvu[16];
             decode_nvfp4_wv(*(const uint32_t*) (bg + 4 + sub * 8), *(const uint32_t*) (bg + 8 + sub * 8), wvg);
             decode_nvfp4_wv(*(const uint32_t*) (bu + 4 + sub * 8), *(const uint32_t*) (bu + 8 + sub * 8), wvu);
@@ -4597,8 +4680,16 @@ __global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __re
         const uint32_t w = __ldg(qr + it * 32 + lane);
         const float4 xv = __ldg(x4 + it * 32 + lane);
         const float dv = h2f(__ldg(dr + it * 4 + (lane >> 3)));
-        acc += dv * ((float) (int8_t) (w & 0xFFu) * xv.x + (float) (int8_t) ((w >> 8) & 0xFFu) * xv.y +
-                     (float) (int8_t) ((w >> 16) & 0xFFu) * xv.z + (float) (int8_t) (w >> 24) * xv.w);
+        if (tune_fma()) {   // (IK2_TUNE: the four products as one chain, the block's scale fused into the sum)
+            acc = fmaf(dv, fmaf((float) (int8_t) (w >> 24), xv.w,
+                                fmaf((float) (int8_t) ((w >> 16) & 0xFFu), xv.z,
+                                     fmaf((float) (int8_t) ((w >> 8) & 0xFFu), xv.y,
+                                          (float) (int8_t) (w & 0xFFu) * xv.x))),
+                       acc);
+        } else {
+            acc += dv * ((float) (int8_t) (w & 0xFFu) * xv.x + (float) (int8_t) ((w >> 8) & 0xFFu) * xv.y +
+                         (float) (int8_t) ((w >> 16) & 0xFFu) * xv.z + (float) (int8_t) (w >> 24) * xv.w);
+        }
     }
     acc = wsum(acc);
     if (lane == 0 && !mv_conv_row(c0, row, acc) && !mv_conv_row(c1, row, acc)) y[row] = acc;
@@ -5035,7 +5126,7 @@ __global__ void decode_f16_nvfp4_kernel(const uint8_t* blocks, size_t nsub, uint
     if (sb >= nsub) return;
     const uint8_t* b = blocks + (sb >> 2) * 36;
     const int sub = (int) (sb & 3);
-    const float d = ue4m3((uint8_t) (*(const uint32_t*) b >> (8 * sub)));
+    const float d = ue4m3x((uint8_t) (*(const uint32_t*) b >> (8 * sub)));
     const uint32_t q0 = *(const uint32_t*) (b + 4 + sub * 8), q1 = *(const uint32_t*) (b + 8 + sub * 8);
     const float2 w01 = e2m1_pair_lo(q0), w23 = e2m1_pair_lo(q0 >> 16);
     const float2 w45 = e2m1_pair_lo(q1), w67 = e2m1_pair_lo(q1 >> 16);
@@ -6633,6 +6724,36 @@ void launch_experts_down(const uint8_t* const* blob, int S, int ty_down, size_t 
         blob, ty_down, off_down, h, C, F, mv_row_bytes(ty_down, F), y);
 }
 
+// (IK2_TUNE: the flag the dots read - a __constant__ set once from the host; the dots' read of it is a uniform,
+//  cached load the compiler hoists out of their loops)
+// (IK2_E4LUT: the scale table filled from the decode itself, then the flag that makes the dots read it)
+void set_e4lut(int on) {
+    float t[256];
+    for (int i = 0; i < 256; ++i) t[i] = ue4m3((uint8_t) i);   // (the host build of the same inline: no second formula)
+    cudaMemcpyToSymbol(c_e4m3, t, sizeof t);
+    cudaMemcpyToSymbol(g_e4lut, &on, sizeof on);
+    check("set_e4lut");
+}
+void e4lut_probe(unsigned* d_out) {
+    e4lut_probe_kernel<<<(256 + 63) / 64, 64>>>(d_out);
+    check("e4lut_probe");
+}
+// (IK2_XGLOBAL: the NVFP4 pair reads the input through global memory instead of the block's staged copy)
+void set_xglobal(int on) {
+    cudaMemcpyToSymbol(g_xglobal, &on, sizeof on);
+    check("set_xglobal");
+}
+void set_tune_fma(int on) {
+    cudaMemcpyToSymbol(g_tune_fma, &on, sizeof on);
+    check("set_tune_fma");
+}
+int tune_fma_on() {
+    int v = 0;
+    cudaMemcpyFromSymbol(&v, g_tune_fma, sizeof v);
+    check("tune_fma_on");
+    return v;
+}
+
 bool experts_mma_fits(int ty_gate, int ty_up, int ty_down, int C, int F) {
     return ty_gate == kNVFP4 && ty_up == kNVFP4 && ty_down == kNVFP4 && C % 64 == 0 && F % 64 == 0;
 }
@@ -6687,10 +6808,43 @@ void experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_g
     else launch_experts_gate_up<4, 4>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, gu, s);
     check("experts_gate_up");
 }
+// (the tiling both expert launchers choose, measured twice and settled: 4 warps a block - the grid's rows split 2 a warp -
+//  is the default on EVERY arch.  The 8-warp form (the same grid, 256 threads a block) was tried as a default and lost
+//  on both: 16% on the lab's sm_61 1070, 7.7% on an sm_86 box (25.17 against 27.10 tok/s, medians of 12 runs), for the
+//  same bytes.  The occupancy theory that suggested it - xp_floats(.) floats of shared input, so 4 blocks an SM, so 128
+//  threads a block leaves the SM a quarter full and 256 fills it - is falsified for this workload on both architectures:
+//  128-thread blocks win everywhere measured.  Either form writes the same bytes: a row's dot keeps its warp, its lanes
+//  and their order.  IK2_KT_WARPS=4|8 pins one on any arch, for a bench.
+//
+//  TWO TRAPS, both of which cost a lab run:
+//  * NOT arch_class(): that is a CAPABILITY class, and it upclasses anything under sm_75 to 70 (see its `c >= 80 ? 80 :
+//    cc >= 75 ? 75 : 70` at ik2_kernels.cu:6165) for the Volta kernel routing - so on Pascal it answers 70 and any
+//    `>= 70` test is true there.  Never use arch_class() as a real-capability test.
+//  * NOT #ifdef MAYA_IK2_PASCAL either: CMakeLists.txt:995 defines it on the maya-ik2 target only, so this library
+//    (ik2_kernels, and ik2_kernels_test with it) never sees it and a compile-time gate would silently do nothing.
+static bool kt_wide_blocks() {
+    static const bool wide = [] {
+        int d = 0, ma = 0;
+        // (the device's real major version, for the log's line only now: 6 Pascal, 7 Volta, 8 Ampere, 9 Hopper)
+        const bool known = cudaGetDevice(&d) == cudaSuccess &&
+                           cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, d) == cudaSuccess;
+        const char* e = getenv("IK2_KT_WARPS");
+        const int kw = e ? atoi(e) : 0;
+        // (4 warps a block, universally - only the override selects the wide form)
+        const bool w = kw == 8;
+        if (getenv("IK2_KT_LOG"))   // (a line for a bench's log: which form, the silicon it read, and why)
+            std::printf("kernel tiling: %d warps a block (device major %d%s)%s\n", w ? 8 : 4, known ? ma : -1,
+                        known && ma < 7 ? ", Pascal" : "", kw ? ", IK2_KT_WARPS" : " - the measured default");
+        return w;
+    }();
+    return wide;
+}
+
 void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_down, const uint16_t* h, int C, int F,
                   float* y, cudaStream_t s) {
     if (S <= 0) return;
-    if (S <= 4) launch_experts_down<4, 2>(blob, S, ty_down, off_down, h, C, F, y, s);
+    if (S <= 4 && kt_wide_blocks()) launch_experts_down<8, 1>(blob, S, ty_down, off_down, h, C, F, y, s);
+    else if (S <= 4) launch_experts_down<4, 2>(blob, S, ty_down, off_down, h, C, F, y, s);
     else launch_experts_down<4, 4>(blob, S, ty_down, off_down, h, C, F, y, s);
     check("experts_down");
 }
@@ -6734,7 +6888,10 @@ void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, i
                             const float* x, int C, int F, const float* sg, const float* su, float gcap, float ucap,
                             uint16_t* h, cudaStream_t s) {
     if (S <= 0) return;
-    if (S <= 8) launch_experts_gate_up_swiglu<4, 2>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s);
+    if (S <= 8 && kt_wide_blocks()) launch_experts_gate_up_swiglu<8, 1>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F,
+                                                                       sg, su, gcap, ucap, h, s);
+    else if (S <= 8) launch_experts_gate_up_swiglu<4, 2>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap,
+                                                         ucap, h, s);
     else launch_experts_gate_up_swiglu<4, 4>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s);
     check("experts_gate_up_swiglu");
 }
@@ -6825,9 +6982,17 @@ void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* 
         std::fprintf(stderr, "ik2::k::mv_blocks: type %d, K %d\n", type, K);
         std::abort();
     }
-    if (N <= 512) launch_mv_blocks<2, 1>(type, W, N, K, x, y, s);
+    // (IK2_TUNE's tiling: the rows a warp takes are a tiling choice only - a row's dot, its lanes and their order are
+    //  untouched, so every split is the same bytes.  A head's 150k rows (the 5-6 ms call in the profile) takes 16 rows a
+    //  block: half the blocks' input loads, twice the warps an SM holds.  IK2_MVB_ROWS overrides for a bench.)
+    static const int want = getenv("IK2_MVB_ROWS") ? std::atoi(getenv("IK2_MVB_ROWS")) : 0;
+    if (want == 1) launch_mv_blocks<8, 1>(type, W, N, K, x, y, s);
+    else if (want == 2) launch_mv_blocks<8, 2>(type, W, N, K, x, y, s);
+    else if (want == 4) launch_mv_blocks<8, 4>(type, W, N, K, x, y, s);
+    else if (N <= 512) launch_mv_blocks<2, 1>(type, W, N, K, x, y, s);
     else if (N <= 2048) launch_mv_blocks<4, 1>(type, W, N, K, x, y, s);
-    else launch_mv_blocks<4, 2>(type, W, N, K, x, y, s);
+    else if (N <= 16384) launch_mv_blocks<4, 2>(type, W, N, K, x, y, s);
+    else launch_mv_blocks<8, 2>(type, W, N, K, x, y, s);
     check("mv_blocks");
 }
 
@@ -7315,3 +7480,5 @@ void experts_down_mem(const uint8_t* const* blob, const int* n, const int* row, 
 bool experts_block_exact() { return experts_mma_split(true) == 8 && experts_mma_split(false) == 4; }
 
 }  // namespace ik2::k
+
+

@@ -442,9 +442,31 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     }
 }
 
+// (IK2_CPU_ROWS: the engine's lane takes the field-proven one-token rows where they exist - iq256_rows1's IQ2_XS /
+//  IQ3_XXS / IQ3_S / IQ1_M forms, ggml-cpu's own bits by construction (pick_rows1 checks them against its dot at the
+//  first use) - and ggml-cpu's dot for every type they do not cover)
+static bool rows_own() {
+    static const bool on = [] {
+        const char* v = std::getenv("IK2_CPU_ROWS");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
 void native_dot_rows(int type, size_t row_bytes, const uint8_t* base, const void* act, int n, int r0, int r1,
                      float* out) {
     init_once();
+    if (rows_own()) {
+        RowsFn f = exact_rows_nt(type, 1);
+        if (f != nullptr) {
+            // (these rows write out[t][r], the row's absolute index - a chunk's out starts at r0, so hand them the
+            //  pointer r0 before it; they never write below r0)
+            const void* av[1] = {act};
+            float* ov[1] = {out - (size_t) r0};
+            f(type, base, row_bytes, n, av, 1, ov, r0, r1);
+            return;
+        }
+    }
     const ggml_type_traits_cpu* t = traits(type);
     if (t == nullptr || t->vec_dot == nullptr) {
         for (int r = r0; r < r1; ++r) out[r - r0] = 0.0f;
@@ -602,13 +624,28 @@ bool native_selftest(const std::vector<int>& types, std::string& out) {
             if (hand_rows(ty, rb, w.data(), a.data(), n, 0, 1, &hgot))
                 herr = std::fabs((double) hgot - ref) / std::max(1e-9, std::fabs(ref));
         }
-        if (herr >= 0.0)
-            std::snprintf(line, sizeof line, "  cpu dot selftest: %-8s rel %.2e (ggml) / %.2e (hand)%s\n",
-                          ggml_type_name((ggml_type) ty), err, herr, (err < 1e-3 && herr < 1e-3) ? "" : "  FAIL");
+        double oerr = -1.0;
+        if (rows_own()) {   // (IK2_CPU_ROWS: the field-proven one-token rows, when they exist for the type)
+            RowsFn f = exact_rows_nt(ty, 1);
+            if (f != nullptr) {
+                float ogot = 0.0f;
+                const void* av[1] = {a.data()};
+                float* ov[1] = {&ogot};
+                f(ty, w.data(), rb, n, av, 1, ov, 0, 1);
+                oerr = std::fabs((double) ogot - ref) / std::max(1e-9, std::fabs(ref));
+            }
+        }
+        if (herr >= 0.0 || oerr >= 0.0)
+            std::snprintf(line, sizeof line, "  cpu dot selftest: %-8s rel %.2e (ggml)%s%s%s\n",
+                          ggml_type_name((ggml_type) ty), err, herr >= 0.0 ? " (hand)" : "",
+                          oerr >= 0.0 ? " (ds4 rows)" : "",
+                          (err < 1e-3 && (herr < 0.0 || herr < 1e-3) && (oerr < 0.0 || oerr < 1e-3)) ? "" : "  FAIL");
         else
             std::snprintf(line, sizeof line, "  cpu dot selftest: %-8s rel %.2e%s\n", ggml_type_name((ggml_type) ty), err,
                           err < 1e-3 ? "" : "  FAIL");
-        ok = ok && err < 1e-3 && (herr < 0.0 || herr < 1e-3);
+        if (oerr >= 0.0)   // (the ds4 rows' own figure, a type)
+            std::fprintf(stderr, "    %s own rows: rel %.2e\n", ggml_type_name((ggml_type) ty), oerr);
+        ok = ok && err < 1e-3 && (herr < 0.0 || herr < 1e-3) && (oerr < 0.0 || oerr < 1e-3);
         out += line;
     }
     return ok;

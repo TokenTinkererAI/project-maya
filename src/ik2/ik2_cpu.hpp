@@ -26,16 +26,66 @@ bool nvfp4_ok();
 /// Whether this build takes GGUF-form experts at all (ggml-cpu's row dots: AVX2 or AVX-512, chosen at run time).
 bool native_ok();
 
+struct NativeJob;   // (defined below: IK2_POOL2's job records point at one)
+
 /// Worker threads taking tasks in order; wait(): until every task posted so far (and the ones they posted) is done.
 class Pool {
 public:
     explicit Pool(int n);
     ~Pool();
     void post(std::function<void()> f);
+    /// The same, n at once: one lock and one wake for a block of tasks (a visit posts 3n a CPU expert, and every
+    /// post is a lock + a wake on the routing round trip's critical path).
+    void post_many(std::function<void()>* f, int n);
     void wait();
     int size() const { return (int) th_.size(); }
+    /// IK2_WATCH's report: the tasks still outstanding (the lane's stalls are CPU work, not a stream's).
+    long long pending() const { return p2_on() ? (long long) p2_pending_.load() : (long long) q_.size(); }
+
+    /// IK2_POOL2: one expert's dots as POD tasks on a lock-free ring (no std::function, no heap, one claim each), the
+    /// host working the ring while it waits.  False when the gate is off: the caller keeps the closure path then.
+    bool p2_native_expert(NativeJob* job, int C, int F, float gcap, float ucap);
+    bool p2_on() const { return p2_; }
 
 private:
+    void worker(int i);
+    // ---- IK2_POOL2 (see ik2_cpu.cpp's block)
+    struct P2Task {
+        int kind;      // 0: gate/up rows, 1: down rows
+        int job;       // the P2Job slot
+        int gen;       // that slot's generation when the task was pushed (a late task of a reused slot is dropped)
+        int part;      // gate (0) or up (1) for kind 0
+        int r0, r1;    // the rows of this task
+    };
+    struct P2Job {
+        const void* fp = nullptr;   // strata::kernels::cpu::NativeFmt*
+        NativeJob* job = nullptr;
+        int n = 1, nC = 0, nF = 0;
+        float gcap = 0, ucap = 0;
+        std::atomic<int> left{0};
+        int gen = 0;
+    };
+    struct P2Slot {
+        std::atomic<uint32_t> seq{0};
+        P2Task t{};
+    };
+    static constexpr int kP2Cap = 256, kP2Mask = kP2Cap - 1, kP2Jobs = 64;
+    bool p2_ = false;
+    std::unique_ptr<P2Job[]> p2jobs_;
+    std::unique_ptr<P2Slot[]> p2ring_;
+    alignas(64) std::atomic<uint64_t> p2_enq_{0};
+    alignas(64) std::atomic<uint64_t> p2_deq_{0};
+    alignas(64) std::atomic<int> p2_pending_{0};
+    alignas(64) std::atomic<uint32_t> p2_park_{0};
+    int p2_next_job_ = 0;
+    bool p2_push(const P2Task& t);
+    bool p2_pop(P2Task& t);
+    void p2_run(const P2Task& t);
+    void p2_drain();               // the host works the ring until nothing is pending
+    void p2_worker(int i);         // a worker's park/claim loop on the ring
+    int p2_job_slot();             // the next job record, retired by wait()
+    void p2_host_pin();            // the calling (host) thread, once, to the first core's sibling
+
     std::vector<std::thread> th_;
     std::deque<std::function<void()>> q_;
     std::mutex m_;

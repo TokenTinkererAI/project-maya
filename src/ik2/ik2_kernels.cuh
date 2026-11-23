@@ -523,4 +523,18 @@ void experts_down_mem(const uint8_t* const* blob, const int* n, const int* row, 
 /// splits the same: IK2_EXPERT_MMA_SPLIT 8, _DOWN 4, the defaults).
 bool experts_block_exact();
 
+/// IK2_TUNE's switch: the dequantised dots as fused multiply-adds (see ik2_kernels.cu's g_tune_fma).  Off, the engine's
+/// own expressions run, to the bit; on, a dot lands a few ulp from them.  Set before the kernels first run.
+void set_tune_fma(int on);
+int tune_fma_on();
+/// IK2_E4LUT: NVFP4's sub-block scales (the 256 ue4m3 values) into the constant bank, and the flag that makes the dots
+/// read the table instead of the bit-decode.  The table is filled from the decode itself, so the two are the same bits;
+/// e4lut_probe() writes the 256 values the dot would read to `d_out` (the kernel test checks them for equality).
+void set_e4lut(int on);
+void e4lut_probe(unsigned* d_out);
+/// IK2_XGLOBAL: an NVFP4 gate/up pair reads the input through global memory (L1/L2) instead of the block's staged
+/// shared copy.  A scheduling toggle only - the same 16 values in the same order, so the sums are the staged path's.
+void set_xglobal(int on);
+
 }  // namespace ik2::k
+
