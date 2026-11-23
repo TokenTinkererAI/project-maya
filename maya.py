@@ -11292,6 +11292,16 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     kept = keep_args(old.get("args") or [], args, ("--threads", "--eos", "--cache-gb"))
     inst = {"family": "ik2", "quant": Q.OTHERS[("ik2", Q.IK2_QUANT)], "ik2_quant": Q.IK2_QUANT, "drafting": how}
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup)
+    if vision is None:
+        # (the CPU encoder is the DEFAULT: no "gpu" key, so it keeps no VRAM; an explicit config "vision" block - the
+        #  setup's own tower - replaces it whole, and an absent binary is a NOTE rather than a failed setup)
+        from serve.server import default_ik2_vision
+        vision, why = default_ik2_vision(str(ROOT))
+        if vision is not None:
+            ok(f"pictures: the CPU encoder is on by default ({vision['exe']} with {Path(vision['mmproj']).name}; no "
+               "VRAM kept for it)")
+        else:
+            warn(f"pictures: off - {why}")
     cfg = {"exe": str(IK2_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(tok), "model_name": IK2_MODEL_NAME,
            **({"backend": "hip"} if pc.get("backend") == "hip" else {}),
            "gpu": [g["index"] for g in pc["gpus"]], "sampling": sampling, "reasoning_effort": effort,

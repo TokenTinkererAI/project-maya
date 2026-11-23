@@ -56,6 +56,33 @@ from urllib.parse import parse_qs, unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
+
+# The CPU image encoder this tree ships with: `build-vision-cpu/bin/maya-vision` with `models/mmproj-BF16.gguf`.  It is
+# the proven 2026-11 default (no "gpu" key at all -> the encoder runs on the CPU and keeps no VRAM).  An explicit
+# "vision" block in the config replaces this whole default; a missing binary or mmproj is a NOTE and the model serves
+# text-only - never an error.
+DEFAULT_VISION_EXE = "build-vision-cpu/bin/maya-vision"
+DEFAULT_VISION_MMPROJ = "models/mmproj-BF16.gguf"
+
+
+def default_ik2_vision(cwd: str | None = None) -> tuple[dict | None, str]:
+    """(the default CPU vision block, "") or (None, why it is off).  Relative paths resolve against the repo root
+    first and the config's cwd second (a 'build-vision-cpu' beside the model folder works too)."""
+    roots = [ROOT] + ([Path(cwd)] if cwd and Path(cwd) != ROOT else [])
+    exe = mm = None
+    for r in roots:
+        for name in (DEFAULT_VISION_EXE, DEFAULT_VISION_EXE + ".exe"):
+            if exe is None and (r / name).is_file():
+                exe = (r / name).resolve()
+        if mm is None and (r / DEFAULT_VISION_MMPROJ).is_file():
+            mm = (r / DEFAULT_VISION_MMPROJ).resolve()
+    if exe is None:
+        return None, (f"no CPU encoder at {DEFAULT_VISION_EXE} (build it with the vision tools; the model reads text "
+                      "only)")
+    if mm is None:
+        return None, f"no {DEFAULT_VISION_MMPROJ} beside the encoder (the model reads text only)"
+    return {"exe": str(exe), "mmproj": str(mm)}, ""
+
 from serve import ds4_vision, gpu_map, hy4_vision, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
 from serve import attach, mixed_gpus  # noqa: E402
 from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
@@ -7807,6 +7834,15 @@ def main() -> int:
             print(f"[maya] sampling defaults from the {'config' if 'sampling' in cfg else 'model'}: {pretty}",
                   flush=True)
         vcfg = cfg.get("vision") or None
+        if vcfg is None and models.family(cfg) == "ik2":
+            # (vision on the CPU by default: the proven 2026-11 setup.  An explicit config "vision" block above wins
+            #  whole; an absent encoder is a NOTE and the model serves text-only.)
+            vcfg, why = default_ik2_vision(cfg.get("cwd"))
+            if vcfg is not None:
+                print(f"[maya] images: the CPU encoder is on by default ({vcfg['exe']} with "
+                      f"{Path(vcfg['mmproj']).name}); a \"vision\" block in the config overrides it", flush=True)
+            else:
+                print(f"[maya] images: NOTE vision is off - {why}", flush=True)
         vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg else None
         venv = dict(env)
         if vcfg and vcfg.get("gpu") and gpu_list(cfg) and cfg.get("backend") not in ("hip", "metal"):

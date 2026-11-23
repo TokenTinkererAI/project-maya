@@ -446,7 +446,8 @@ __host__ __device__ __forceinline__ float e4m3fn_host(uint8_t q) {   // (the dum
     }
     return (q & 0x80) ? -mag : mag;
 }
-bool g_kv_fp8 = false;
+bool g_kv_fp8 = true;   // (proven default from the 2026-11 campaign: an fp8 KV cache - half the bytes and the faster
+                        //  one deep in a context; IK2_KV=f16 still selects FP16 explicitly)
 // (IK2_KV4: the KV cache in the 4-bit block format - 36 bytes a 64 values, four ue4m3 scales and E2M1 nibbles - which is
 //  56.2% of fp8's bytes.  Storage, the write's pack, the decode's inline read and the prefill's unpack all key off this
 //  one flag; the paths it does not serve yet refuse by name (see main's gate).)
@@ -2988,7 +2989,8 @@ size_t g_elastic_cap = 0;         // bytes the placed experts may take (0: unset
 // (at load, after the tier: the buffers that can lend - every full visit's K and V in VRAM)
 void lend_init(Model& M) {
     const Config& c = M.c;
-    const bool want_lend = getenv("IK2_KVLEND") && std::atoi(getenv("IK2_KVLEND"));
+    // (proven default from the 2026-11 campaign: lending is ON - the +8.4% / +9.5% lever; IK2_KVLEND=0 turns it off)
+    const bool want_lend = !getenv("IK2_KVLEND") || std::atoi(getenv("IK2_KVLEND")) != 0;
     const bool want_elastic = getenv("IK2_ELASTIC") && std::atoi(getenv("IK2_ELASTIC"));
     if (!want_lend && !want_elastic) return;
     if (getenv("IK2_KVLEND_ROOM")) kLendRoom = std::max(kLendGuard + 8, std::atoi(getenv("IK2_KVLEND_ROOM")));
@@ -5812,8 +5814,9 @@ int main(int argc, char** argv) {
     use_dev(0);
     g_overlap = !getenv("IK2_OVERLAP") || std::atoi(getenv("IK2_OVERLAP"));
     for (auto& e : g_ring) CU(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
-    // (off by default: on an RTX PRO 6000 node's Xeon 6737P an NVFP4 expert takes 0.73 ms on 7 threads against 0.33 ms
-    //  over PCIe, and the lane measured 16.4 against 16.8 tok/s - IK2_CPU=1 to try it)
+    // (proven default from the 2026-11 campaign: 0.5 - half the misses computed on the CPU lane; the hybrid's measured
+    //  best on this class of box.  IK2_CPU_FRAC=0 still turns the lane off; any other value sets the share.)
+    g_cpu_frac = 0.5;
     if (const char* cf = getenv("IK2_CPU_FRAC")) g_cpu_frac = std::clamp(std::atof(cf), 0.0, 1.0);
     // (IK2_CPU_FRAC: the pool on any CPU ggml-cpu has the dots for; IK2_CPU alone keeps its AVX-512 gate.  The pool
     //  keeps --threads' default of 8 (7 workers): all 12 logical threads measured *worse* for the hybrid - 17-24
@@ -5834,7 +5837,8 @@ int main(int argc, char** argv) {
     g_droute = getenv("IK2_DROUTE") && std::atoi(getenv("IK2_DROUTE")) != 0;
     g_dpack = getenv("IK2_DPACK") && std::atoi(getenv("IK2_DPACK")) != 0;
     g_dcbatch = getenv("IK2_DCBATCH") && std::atoi(getenv("IK2_DCBATCH")) != 0;
-    g_ccache = getenv("IK2_CCACHE") && std::atoi(getenv("IK2_CCACHE")) != 0;
+    // (proven default from the 2026-11 campaign: ON)
+    g_ccache = !getenv("IK2_CCACHE") || std::atoi(getenv("IK2_CCACHE")) != 0;
     // (IK2_KV4: the 4-bit KV cache - storage, the write's pack, the decode's inline read (the split path) and the
     //  prefill's unpack.  It implies fp8-class scale storage (a ue4m3 per 16 values inside each block).
     //  IK2_KV4V: the same block on the V side only, K staying fp8 - the trial after both-4-bit's quality fail.)
@@ -5861,15 +5865,22 @@ int main(int argc, char** argv) {
             k::set_kv4_mse(1);
             std::printf("kv4: the pack's scale by least squared error\n");
         }
-        if (g_kv4v && !g_kv4 && g_ccache)
-            die("IK2_KV4V: the conversation cache's KV windows assume one row size for K and V - run without IK2_CCACHE");
+        if (g_kv4v && !g_kv4 && g_ccache) {
+            // (the conversation cache is ON by default now; the V-only mode's two row sizes cannot be snapshotted, so
+            //  this run turns it off - loudly, rather than dying on a default the user did not set)
+            g_ccache = false;
+            std::printf("NOTE IK2_KV4V: the conversation cache's KV windows assume one row size for K and V - "
+                        "IK2_CCACHE is off for this run\n");
+        }
         std::fflush(stdout);
     }
-    if (getenv("IK2_E4LUT") && std::atoi(getenv("IK2_E4LUT"))) {   // (task 2a: the scale LUT, filled from the decode)
+    // (proven default from the 2026-11 campaign: ON - byte-identical, and it takes a LUT lookup off the decode)
+    if (!getenv("IK2_E4LUT") || std::atoi(getenv("IK2_E4LUT")) != 0) {   // (task 2a: the scale LUT, filled from the decode)
         k::set_e4lut(1);
         std::printf("kernel tuning: NVFP4's scales read from the constant table (filled from the decode itself)\n");
     }
-    if (getenv("IK2_XGLOBAL") && std::atoi(getenv("IK2_XGLOBAL"))) {   // (task 2b: the pair dot reads x from global)
+    // (proven default from the 2026-11 campaign: ON - byte-identical, and it drops the staged copy and its barrier)
+    if (!getenv("IK2_XGLOBAL") || std::atoi(getenv("IK2_XGLOBAL")) != 0) {   // (task 2b: the pair dot reads x from global)
         k::set_xglobal(1);
         std::printf("kernel tuning: the NVFP4 pair dot reads its input through global memory (no staging, no barrier)\n");
     }
@@ -6833,9 +6844,10 @@ int main(int argc, char** argv) {
     }
     CU(cudaMemGetInfo(&fr, &tot));
     // (what is left free: 2 GiB beside a cache that streams experts in and out; a quarter of one when every expert
-    //  stays in VRAM - nothing more is allocated but a token's graph; the offload path: IK2_ROOM_MB, 1 GiB)
+    //  stays in VRAM - nothing more is allocated but a token's graph; the offload path: IK2_ROOM_MB, 64 MiB (the
+    //  2026-11 campaign's proven default - the tier keeps the VRAM the old 1 GiB reserve used to hold))
     const size_t room = g_fast_want ? (size_t) 256 << 20
-                      : g_off_want ? (size_t) (getenv("IK2_ROOM_MB") ? std::atof(getenv("IK2_ROOM_MB")) : 1024.0) << 20
+                      : g_off_want ? (size_t) (getenv("IK2_ROOM_MB") ? std::atof(getenv("IK2_ROOM_MB")) : 64.0) << 20
                                    : (size_t) 2 << 30;
     const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
@@ -8149,6 +8161,7 @@ int main(int argc, char** argv) {
     g_offs.lane.reset();
     return 0;
 }
+
 
 
 
