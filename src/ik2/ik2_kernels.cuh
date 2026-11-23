@@ -276,7 +276,7 @@ void attn_decode_f16(const float* q, const float* r, const float* sink, const ui
 void prep_qkv_r_fp8(float* q, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in, uint8_t* vc,
                     float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip,
                     float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
-                    float k_scale, float v_scale, cudaStream_t s);
+                    float k_scale, float v_scale, cudaStream_t s, int kv4 = 0, int kv4k = 0);   // (IK2_KV4: kv4 = V's staging rows; kv4k = K's)
 void attn_multi_fp8(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                     int kv_cap, int nq, int H, int Hkv, int k0, int nk, int qpos0, float qk_scale,
                     float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
@@ -284,7 +284,7 @@ void attn_multi_fp8(const float* q, const float* r, const float* sink, const uin
 void attn_decode_fp8(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                      int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale,
                      float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
-                     float* out, cudaStream_t s);
+                     float* out, cudaStream_t s, int kv4 = 0, int row4 = 0, int kv4k = 0);   // (IK2_KV4: V's 4-bit row bytes)
 /// Unwrap nk KV rows starting at k0 from FP8 ring buffer into contiguous FP16 [nk, KD] scaled by k_inv_scale / v_inv_scale.
 void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int KD,
                           float k_inv_scale, float v_inv_scale, uint16_t* k_out16, uint16_t* v_out16,
@@ -535,6 +535,46 @@ void e4lut_probe(unsigned* d_out);
 /// IK2_XGLOBAL: an NVFP4 gate/up pair reads the input through global memory (L1/L2) instead of the block's staged
 /// shared copy.  A scheduling toggle only - the same 16 values in the same order, so the sums are the staged path's.
 void set_xglobal(int on);
-
+/// IK2_KVDUMP: the position whose 4-bit row the attention kernel prints (with head_off, slot and g) - -1: none.
+void set_kv4_dump(int pos);
+/// IK2_KV4MSE: the sub-block scale chosen by least squared error over the 128 candidate bytes (off: amax/12).
+void set_kv4_mse(int on);
+/// IK2_KV4STORE: one position's store report from inside prep_qkv_r_impl_kernel (its staging index and bytes).
+void set_kv4_store(int pos);
+/// IK2_KVAUDIT: the real-data error distribution of the 4-bit pack on `n` staging bytes (the fp8-form K/V a run wrote),
+/// both scales side by side - the numbers the synthetic selftests cannot give.
+void kv4_stage_audit(const uint8_t* d8, int n);
+/// IK2_KV4's codec (phase 1, inert): 36 bytes a 64-value block - four ue4m3 scales (one a 16-value sub-block) and 32
+/// bytes of E2M1 nibbles - and the row maths: (ceil(KD/64))*36 bytes, whole blocks a row so lending needs no format tag.
+size_t kv4_row_bytes(int KD);
+/// The device decode, into `out` [n] floats (n a multiple of 64): the reader phase 2 will call on a window.
+void kv4_unpack_dev(const uint8_t* in, float* out, int n);
+/// The host pack (one 36-byte block a 64 values) and the round-trip selftest: pack -> device decode on synthetic KV
+/// values, with fp8's own round trip beside it, so the number reported is the 4-bit cost against today's storage.
+void kv4_pack_host(const float* x, uint8_t* out, int n);
+void kv4_selftest(float* max_abs4, float* max_abs8, int n);
+/// The kernel-side lane*4 read (kv4_lane4) against the flat per-value decode on a packed 128-value head: the count of
+/// mismatches - what proves the decode kernel's addressing before any cache stores this form.
+int kv4_lane_align_selftest();
+/// The write path's geometry end to end: a staging row of KVh heads x D values -> kv4_pack_rows -> each head read with
+/// kv4_lane4 at its base against the staging's own value.  *worst_rel is the worst error as a fraction of the head's
+/// scale (a format's own quantisation step is ~1/8).  -1: D or KVh*D not a multiple of 64.
+int kv4_rows_selftest(int KVh, int D, float* worst_rel);
+/// The write path: a chunk's E4M3 staging [T][KVh][D] -> the packed store, the rows mapped to their slots (kv_cap > 0:
+/// a ring, as a sliding layer's).  D must be a multiple of 64 (the block), row4 is kv4_row_bytes(KD).
+void kv4_pack_rows(const uint8_t* src8, uint8_t* dst4, int T, int KVh, int D, int kv_cap, int pos0, int row4,
+                   cudaStream_t s);
+/// The prefill's reader: nk packed rows -> the f16 window the chunked GEMM path takes, as unpack_kv_fp8_to_f16 does.
+void unpack_kv4_to_f16(const uint8_t* kc4, const uint8_t* vc4, int kv_cap, int k0, int nk, int KD, int row4,
+                       float k_inv, float v_inv, uint16_t* k16, uint16_t* v16, cudaStream_t s, int kv4k = 1);
 }  // namespace ik2::k
+
+
+
+
+
+
+
+
+
 

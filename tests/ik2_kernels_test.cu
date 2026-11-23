@@ -3188,6 +3188,28 @@ int main() {
         CU(cudaFree(d));
         k::set_e4lut(0);
     }
+    // (IK2_KV4's codec: the round trip on synthetic KV values, against fp8's own.  Inert in phase 1: nothing in the cache
+    //  reads or writes the 4-bit form yet - this is the format's primitive and the number its quality budget starts from.)
+    {
+        float d4 = 0.0f, d8 = 0.0f;
+        k::kv4_selftest(&d4, &d8, 4096);
+        const size_t row = k::kv4_row_bytes(1024);
+        std::printf("ok   %-34s worst |delta| %.3e against fp8's %.3e (%.2fx), row 1024 = %zu bytes (%.1f%% of fp8)\n",
+                    "KV4 block codec: round trip", d4, d8, d8 > 0 ? d4 / d8 : 0.0, row, 100.0 * (double) row / 1024.0);
+        const int bad = k::kv4_lane_align_selftest();   // (the decode kernel's lane*4 addressing, value for value)
+        std::printf("%s %-34s %d mismatches over 32 lanes x 4 values\n", bad ? "FAIL" : "ok  ",
+                    "KV4 lane*4 read = the flat decode", bad);
+        g_fail += bad ? 1 : 0;
+        float wrel = 0.0f;
+        const int rbad = k::kv4_rows_selftest(1, 128, &wrel);   // (write-path geometry: stage -> pack -> lane read; was parked on the pack fault)
+        std::printf("%s %-34s worst rel %.3e (a 4-bit step is ~0.125)\n", (rbad == 0 && wrel < 0.25f) ? "ok  " : "FAIL",
+                    "KV4 rows: pack -> lane4 per head", wrel);
+        g_fail += (rbad == 0 && wrel < 0.25f) ? 0 : 1;
+        // (KV4's write-path geometry check was parked: kv4_rows_selftest faults inside kv4_pack_rows even for a
+        //  minimal T=1, KVh=1, D=128 call - revived for the compute-sanitizer memcheck diagnosis.)
+        g_fail += (d4 < 1e-6f || d4 > 8.0f * d8) ? 1 : 0;   // (a codec that cannot decode, or is worse than 8x fp8)
+    }
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
+

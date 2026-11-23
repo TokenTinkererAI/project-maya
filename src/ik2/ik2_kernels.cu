@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace ik2::k {
 namespace {
@@ -378,6 +379,12 @@ __device__ __forceinline__ void store_v_warp(const float* vp, uint8_t* vdst, int
     rms_fp8_warp(vp, vdst, D, eps, v_scale);
 }
 
+// (IK2_KVDUMP: one position's 4-bit row, printed from inside the attention kernel - the geometry check that the codec
+//  selftests cannot make, because they never run the kernel's own slot/head arithmetic)
+__constant__ int c_kv4_dump_pos = -1;
+// (IK2_KV4STORE: the STORE's own report for one position - its staging row index and the four bytes it wrote.  Separate
+//  from the dump position because the attention dump prints thousands of lines and overruns CUDA's printf buffer.)
+__constant__ int c_kv4_store_pos = -1;
 // 1 warp (32 threads) per group across all q, k, v, r groups of T tokens
 template <class KV>
 __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const float* k_in, KV* kc, const float* v_in,
@@ -385,7 +392,7 @@ __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const floa
                                        float qk_clip, float rel_clip, float eps, const int* pos, float alpha,
                                        float n_floor, int pos0, int kv_cap, float k_scale, float v_scale,
                                        const int* pos0_d, uint16_t* q16, const uint16_t* sink_w, const float* sink_x,
-                                       int sink_k, float* sink_y, int q_ld = 0, int r_ld = 0) {
+                                       int sink_k, float* sink_y, int q_ld = 0, int r_ld = 0, int kv4 = 0, int kv4k = 0) {
     if (pos0_d) pos0 = *pos0_d;   // (a token of a replayed graph: its position read here)
     const int gid = blockIdx.x;
     const int per_tok = 2 * H + 2 * KVh;
@@ -415,13 +422,20 @@ __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const floa
         const int kv = rem - H;
         const int slot = kv_cap > 0 ? (pos0 + t) % kv_cap : (pos0 + t);
         const float* kp = k_in + ((size_t) t * KVh + kv) * D;
-        KV* kdst = kc + ((size_t) slot * KVh + kv) * D;
+        KV* kdst = kc + (kv4k ? ((size_t) t * KVh + kv) : ((size_t) slot * KVh + kv)) * D;   // (IK2_KV4: staging, per token)
         store_k_warp(kp, kdst, D, qk_clip, k_scale);
+        if (kv4k && c_kv4_store_pos >= 0 && (pos0 + t) == c_kv4_store_pos && kv < 2 && threadIdx.x == 0) {
+            // (IK2_KVDUMP: what the STORE just wrote and where - the decode's staging index, printed by the kernel that
+            //  computed it, so "the pack read the wrong row" and "the store wrote the wrong row" are distinguishable)
+            __syncwarp();
+            printf("kv4store k T=%d pos0=%d t=%d kv=%d idx=%zu kcap=%d b=%02x%02x%02x%02x\n", T, pos0, t, kv,
+                   (size_t) (t * KVh + kv), kv_cap, kdst[0], kdst[1], kdst[2], kdst[3]);
+        }
     } else if (rem < H + 2 * KVh) {
         const int kv = rem - H - KVh;
         const int slot = kv_cap > 0 ? (pos0 + t) % kv_cap : (pos0 + t);
+        KV* vdst = vc + (kv4 ? ((size_t) t * KVh + kv) : ((size_t) slot * KVh + kv)) * D;   // (IK2_KV4: staging, per token)
         const float* vp = v_in + ((size_t) t * KVh + kv) * D;
-        KV* vdst = vc + ((size_t) slot * KVh + kv) * D;
         store_v_warp(vp, vdst, D, eps, v_scale);
     } else {
         const int h = rem - H - 2 * KVh;
@@ -2826,6 +2840,8 @@ __device__ __forceinline__ float dot_u32_f4_fma(uint32_t q4, float4 f) {
 //  the same and in the same order as the staged layout (a 32-value group is identity-mapped by xp()), so the products,
 //  their order and the sums are the staged path's: byte-identical by construction, only the loads move.)
 __constant__ int g_xglobal = 0;
+// (IK2_KV4MSE: the pack's scale by least squared error over the 128 candidate bytes, instead of amax/12)
+__constant__ int g_kv4_mse = 0;
 __device__ __forceinline__ void nvfp4_pair_g(const uint8_t* wg, const uint8_t* wu, const float* x, int K, float& og,
                                              float& ou) {
     const int lane = threadIdx.x & 31;
@@ -2849,6 +2865,216 @@ __device__ __forceinline__ void nvfp4_pair_g(const uint8_t* wg, const uint8_t* w
     og = wsum(ag), ou = wsum(au);
 }
 __device__ __forceinline__ bool tune_xglobal() { return g_xglobal != 0; }
+
+// ---- IK2_KV4's codec (phase 1: INERT - nothing in the KV cache reads or writes this yet; it is the format's primitive,
+//  its round-trip selftest, and the row-bytes maths the 4-bit cache will use once the windowed decode is in).
+//
+// The block is the NVFP4 one this tree already decodes (36 bytes / 64 values): four ue4m3 scales, one a 16-value
+// sub-block, then 32 bytes of E2M1 nibbles (value i: sub-block (i >> 4) & 3, byte 4 + sub*8 + ((i & 15) >> 1), the low
+// nibble for even i).  4.5 bits a value: a KV row of KD values is (KD/64)*36 bytes and stays a whole number of blocks, so
+// lending - which slices and copies whole rows - needs no format tag: main.cu's g_lend.row_bytes becomes this.
+__host__ __device__ __forceinline__ float kv4_code_mag(int c) {   // E2M1's magnitudes, {0,1,2,3,4,6,8,12}
+    const int m = c & 7;
+    return (float) (m < 5 ? m : (m == 5 ? 6 : (m == 6 ? 8 : 12)));
+}
+__host__ __device__ __forceinline__ float kv4_ue4m3_enc(float v) {   // round-to-nearest ue4m3 (3-bit mantissa, max 240)
+    if (!(v > 0.0f)) return 0.0f;
+    if (v >= 240.0f) return 240.0f;
+    if (v < 0x1p-9f) return 0.0f;
+    int e = 0;
+    float m = frexpf(v, &e);           // v = m * 2^e, m in [0.5, 1)
+    int exp = e + 6;
+    int mant = (int) lroundf((m * 2.0f - 1.0f) * 8.0f);
+    if (mant >= 8) mant = 0, ++exp;
+    if (exp <= 0) return lroundf(v * 512.0f) / 512.0f;   // (sub-normal)
+    return ldexpf(1.0f, exp - 7) * (1.0f + (float) mant / 8.0f);
+}
+__host__ __device__ __forceinline__ uint8_t kv4_scale_byte(float v) {   // the code whose decode is nearest v
+    int best = 0;
+    float bd = 1e30f;
+    for (int c = 1; c < 128; ++c) {
+        const float d = fabsf(ue4m3((uint8_t) c) - v);
+        if (d < bd) bd = d, best = c;
+    }
+    return (uint8_t) best;
+}
+// 64 values -> 36 bytes (host and device: the same code, so the test's host pack and the cache's device pack agree)
+// (an E4M3FN byte as a float, from its bits - bias 7, sub-normal m*2^-9, sign - with no library call, so the device and
+//  the host cannot disagree.  The pack decodes its fp8 staging with this: e4m3fn_to_f16's device and host paths were
+//  what put the device's amax at twice the host's (a 2x scale on every sub-block).)
+__host__ __device__ __forceinline__ float kv4_e4m3fn(uint8_t q) {
+    const int e = (q >> 3) & 0xF, m = q & 7;
+    float mag;
+    if (e) {   // (normal: 2^(e-7) * (1 + m/8), assembled from the float's own bits - no library call either side)
+        union { uint32_t u; float f; } bits;
+        bits.u = (uint32_t) ((e + 120) << 23) | ((uint32_t) m << 20);
+        mag = bits.f;
+    } else {
+        mag = (float) m * (1.0f / 512.0f);   // (sub-normal: m * 2^-9, an exact division by a power of two)
+    }
+    return (q & 0x80) ? -mag : mag;
+}
+// (the exact ±1 Hadamard rotation, 16 points, 4 butterfly stages of pure add/sub - the same integer-ordered operations on
+//  the host and the device, so the two cannot round differently.  Rotating a sub-block before quantising spreads an
+//  outlier over all 16 values, which is what a single ue4m3 scale per 16 needs; the inverse is the same butterfly, and
+//  the ÷16 is folded into the sub-block's scale.)
+__host__ __device__ __forceinline__ void kv4_hadamard(float* v) {
+#pragma unroll
+    for (int h = 1; h < 16; h <<= 1)
+#pragma unroll
+        for (int i = 0; i < 16; i += h << 1)
+#pragma unroll
+            for (int j = i; j < i + h; ++j) {
+                const float a = v[j], b = v[j + h];
+                v[j] = a + b, v[j + h] = a - b;
+            }
+}
+// (one 16-value sub-block: its scale byte at blk[sub] and its 8 nibble bytes at blk[4+sub*8 .. +7].  Sub-blocks touch
+//  disjoint bytes, so a kernel can pack all four in parallel - which is what the write path does.)
+__host__ __device__ __forceinline__ void kv4_pack_subblock(const float* xs, uint8_t* blk, int sub) {
+    // (IK2_KV4's rotation: the sub-block is quantised in the Hadamard domain - `r` holds the rotated values, and amax and
+    //  the codes come from them.  The reader undoes it in kv4_unpack_subblock, so both sides see the same numbers.)
+    float r[16];
+    for (int i = 0; i < 16; ++i) r[i] = xs[i];
+    kv4_hadamard(r);
+    float amax = 0.0f;
+    for (int i = 0; i < 16; ++i) amax = fmaxf(amax, fabsf(r[i]));
+    // (the scale: with IK2_KV4MSE the one of the 128 representable ue4m3 codes whose quantisation of these 16 values has
+    //  the least squared error; otherwise the amax/12 heuristic (the largest code reproduces amax exactly).  Both are
+    //  integer/exponent-safe comparisons through kv4_e4m3fn and kv4_code_mag, so host and device agree bit for bit.)
+    if (g_kv4_mse) {
+        int bestc = 1;
+        float best = 1e30f;
+        for (int c = 1; c < 128; ++c) {
+            const float sc = kv4_e4m3fn((uint8_t) c);
+            if (!(sc > 0.0f)) continue;
+            float e2 = 0.0f;
+            for (int i = 0; i < 16; ++i) {
+                const float q = fabsf(r[i]) / sc;
+                int b2 = 0;
+                float bd2 = 1e30f;
+                for (int m = 0; m < 8; ++m) {
+                    const float d2 = fabsf(q - kv4_code_mag(m));
+                    if (d2 < bd2) bd2 = d2, b2 = m;
+                }
+                const float got = kv4_code_mag(b2) * sc * (r[i] < 0.0f ? -1.0f : 1.0f);
+                const float e0 = got - r[i];
+                e2 += e0 * e0;
+            }
+            if (e2 < best) best = e2, bestc = c;
+        }
+        blk[sub] = (uint8_t) bestc;
+    } else {
+        blk[sub] = kv4_scale_byte(amax / 12.0f);
+    }
+    const float scq = ue4m3(blk[sub]);   // (the decode the READER uses: ue4m3, the same table on both sides)
+    for (int i = 0; i < 16; ++i) {
+        const float q = scq > 0.0f ? fabsf(r[i]) / scq : 0.0f;  // (the ROTATED values, abs for the unsigned mag table)
+        int best = 0;
+        float bd = 1e30f;
+        for (int c = 0; c < 8; ++c) {
+            const float d = fabsf(q - kv4_code_mag(c));
+            if (d < bd) bd = d, best = c;
+        }
+        const int code = best | (r[i] < 0.0f ? 8 : 0);
+        uint8_t& by = blk[4 + sub * 8 + (i >> 1)];
+        if ((i & 1) == 0) by = (uint8_t) (code & 0xF);
+        else by = (uint8_t) ((by & 0x0Fu) | ((code & 0xF) << 4));
+    }
+}
+__host__ __device__ __forceinline__ void kv4_pack_block(const float* x, uint8_t* blk) {
+    for (int sub = 0; sub < 4; ++sub) kv4_pack_subblock(x + sub * 16, blk, sub);
+}
+// (one 16-value sub-block decoded: the codes times the sub-block's scale, then the Hadamard undone by the same butterfly -
+//  the /16 folded into the scale.  Both readers (kv4_lane4 and the prefill's unpack kernel) come through here, so they
+//  cannot drift from each other or from the pack.)
+__host__ __device__ __forceinline__ void kv4_unpack_subblock(const uint8_t* blk, int sub, float* out16) {
+    const float sc = ue4m3(blk[sub]) * (1.0f / 16.0f);
+    const uint8_t* by = blk + 4 + sub * 8;
+    for (int i = 0; i < 16; ++i) {
+        const uint8_t b = by[i >> 1];
+        const int c = (i & 1) ? (b >> 4) : (b & 0xF);
+        out16[i] = kv4_code_mag(c & 7) * ((c & 8) ? -1.0f : 1.0f) * sc;
+    }
+    kv4_hadamard(out16);
+}
+__host__ __device__ __forceinline__ float kv4_unpack_value(const uint8_t* blk, int i) {
+    float v16[16];
+    kv4_unpack_subblock(blk, (i >> 4) & 3, v16);
+    return v16[i & 15];
+}
+// (the kernel-side addressing: the decode kernel reads a head's 128 values as `lane*4 .. +3` from the head's
+// block-aligned base.  This is that read, exactly - one function so the test can prove it equals the flat decode for
+// every lane, and so the kernels have one place to call.  Well-defined because (lane*4) mod 16 is 0, 4, 8 or 12: four
+// consecutive values never straddle a 16-value sub-block, so one scale byte and two nibble bytes cover them.
+__host__ __device__ __forceinline__ float4 kv4_lane4(const uint8_t* row, int lane) {
+    const int i = lane * 4;
+    const uint8_t* blk = row + (size_t) (i >> 6) * 36;
+    // (the four lanes of a sub-block share ONE 16-value inverse - lanes 0-3 read sub-block 0, 4-7 sub-block 1, and so on,
+    //  so a warp's 32 lanes cover 8 sub-blocks of the head row.  The group's leader decodes it and each lane takes its own
+    //  float4 by shuffle: the same numbers to the bit (the leader's registers), four decodes a group become one.)
+    const int grp = lane & 3, lead = lane & ~3;
+    (void) grp, (void) lead;
+    // (the whole sub-block per lane: the inverse butterfly needs all 16, and a lane-shared decode (leader + __shfl_sync)
+    //  measured slower and NOT bit-identical on the real kernel - the warp there is not guaranteed fully converged - so
+    //  the redundant 4x decode stays; it is the safe form.)
+    float v16[16];
+    kv4_unpack_subblock(blk, (i >> 4) & 3, v16);
+    return make_float4(v16[i & 15], v16[(i + 1) & 15], v16[(i + 2) & 15], v16[(i + 3) & 15]);
+}
+
+__global__ void kv4_unpack_kernel(const uint8_t* in, float* x, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = kv4_unpack_value(in + (size_t) (i >> 6) * 36, i & 63);
+}
+// (the write path: a chunk's rows sit in an E4M3 staging buffer [T][KVh][D] - the existing store kernels put them there -
+//  and this packs each row into the packed store.  A thread is one 16-value sub-block; the four of a block write disjoint
+//  bytes, so nothing is ordered between them.)
+__global__ void kv4_pack_rows_kernel(const uint8_t* __restrict__ src8, uint8_t* __restrict__ dst4, int T, int KVh, int D,
+                                     int kv_cap, int pos0, int row4) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int per_row = D / 16;
+    if (i >= T * KVh * per_row) return;
+    const int sub = i % per_row, g = (i / per_row) % KVh, t = i / (per_row * KVh);
+    const int d0 = sub * 16;
+    const uint8_t* srow = src8 + ((size_t) t * KVh + g) * D + d0;
+    float v[16];
+    for (int k = 0; k < 16; ++k) v[k] = kv4_e4m3fn(srow[k]);   // (the staging's values: the same scaled ones)
+    const int slot = kv_cap > 0 ? (pos0 + t) % kv_cap : pos0 + t;
+    uint8_t* blk = dst4 + (size_t) slot * row4 + (size_t) (g * D / 64) * 36;   // (the head's block base in the row)
+    // (a head's D values are D/16 sub-blocks; four of them share a 36-byte block, so sub-block `sub` lives in block
+    //  sub/4 at index sub%4 - the block offset is what the first draft of this line dropped)
+    kv4_pack_subblock(v, blk + (size_t) (sub >> 2) * 36, sub & 3);
+}
+// (the prefill reader: nk rows from the packed store into the f16 window the chunked GEMM path takes, exactly as
+//  unpack_kv_fp8_to_f16 does for fp8 - the scales come out in the values, so k_inv / v_inv apply as they do there)
+__global__ void unpack_kv4_to_f16_kernel(const uint8_t* __restrict__ kc4, const uint8_t* __restrict__ vc4, int kv_cap,
+                                         int k0, int nk, int KD, int row4, float k_inv, float v_inv,
+                                         uint16_t* __restrict__ k16, uint16_t* __restrict__ v16, int kv4k) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;   // (a (row, sub-block): the inverse butterfly needs all 16)
+    const int nsub = KD / 16;
+    if (i >= nk * nsub) return;
+    const int r = i / nsub, sub = i % nsub;
+    const int slot = kv_cap > 0 ? (k0 + r) % kv_cap : k0 + r;
+    const uint8_t* kr = kc4 + (size_t) slot * (kv4k ? row4 : KD);   // (K8V4: K keeps its fp8 row)
+    const uint8_t* vr = vc4 + (size_t) slot * row4;
+    const size_t boff = (size_t) ((sub * 16) >> 6) * 36;
+    float k16v[16], v16v[16];
+    if (kv4k)
+        kv4_unpack_subblock(kr + boff, sub & 3, k16v);
+    else
+        for (int j = 0; j < 16; ++j) k16v[j] = e4m3fn_to_f32(kr[(size_t) sub * 16 + j]);   // (the fp8 row, as it was)
+    kv4_unpack_subblock(vr + boff, sub & 3, v16v);
+    for (int j = 0; j < 16; ++j) {
+        const size_t o = (size_t) r * KD + (size_t) sub * 16 + j;
+        k16[o] = f2h(k16v[j] * k_inv);
+        v16[o] = f2h(v16v[j] * v_inv);
+    }
+}// (the row maths the 4-bit cache will use: whole blocks a row, so a row stays individually addressable and lendable.
+//  KD not a multiple of 64: the row pads up to (ceil(KD/64)*64) values and the reader ignores the pad - lending copies
+//  whole rows either way, so nothing downstream needs to know.)
+
+
 
 __device__ __forceinline__ float dot_u32_f4(uint32_t q4, float4 f) {
     if (tune_fma()) return dot_u32_f4_fma(q4, f);
@@ -4435,7 +4661,13 @@ template <class KV>
 __device__ __forceinline__ void attn_flash_range(const float* qh, const float* rh, const KV* kc, const KV* vc,
                                                  int KD, int g, int kv_cap, int k0, int j0, int j1, int qpos,
                                                  float qk_scale, const float* proj, int d_rel, int extent, int window,
-                                                 float* sm_m, float* sm_s, float sm_o[][128]) {
+                                                 float* sm_m, float* sm_s, float sm_o[][128], int kv4 = 0,
+                                                 int row4 = 0, int kv4k = 0) {
+    // (IK2_KV4 / IK2_KV4V: the 4-bit store's rows are `row4` bytes - whole 36-byte blocks of 64 values - and a head's
+    //  128 values are two of them, so its base is (g*128/64)*36 into the row.  The read is kv4_lane4: the same lane*4
+    //  span the fp8 path takes, decoded from nibbles and the sub-block's own ue4m3 scale rather than one global scale.
+    //  The two sides are INDEPENDENT: `kv4` packs V, `kv4k` packs K (IK2_KV4V is K fp8 + V 4-bit), so each side has
+    //  its own base and its own reader while the other keeps the fp8 row.)
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int o = lane * 4;
     const float4 q4 = (((uintptr_t) qh & 15) == 0) ? __ldg((const float4*) (qh + o))
@@ -4448,8 +4680,20 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
         const int dist = qpos - pos;
         if (dist < 0 || dist >= window) continue;
         const int slot = kv_cap > 0 ? pos % kv_cap : pos;
-        const size_t head_off = (size_t) slot * KD + (size_t) g * 128;
-        const float4 k4 = v_load4(kc + head_off, lane);
+        const size_t k_off = kv4k ? (size_t) slot * row4 + (size_t) (g * 128 / 64) * 36
+                                  : (size_t) slot * KD + (size_t) g * 128;
+        const size_t v_off = kv4 ? (size_t) slot * row4 + (size_t) (g * 128 / 64) * 36
+                                 : (size_t) slot * KD + (size_t) g * 128;
+        const float4 k4 = kv4k ? kv4_lane4((const uint8_t*) kc + k_off, lane) : v_load4(kc + k_off, lane);
+        // (IK2_KVDUMP: the row the kernel actually reads, for one position - the geometry's proof.  c_kv4_dump_pos is
+        //  set from the host; lane 0 of warp 0 prints, so one line a head.)
+        if (kv4k && c_kv4_dump_pos >= 0 && pos == c_kv4_dump_pos && lane == 0 && warp == 0) {
+            const uint8_t* r = (const uint8_t*) kc + k_off;
+            // (the VALUE datum the byte dump could not give: what kv4_lane4 returns here, beside the bytes and the slot)
+            printf("kv4attn k g=%d slot=%d off=%llu row=%02x%02x%02x%02x %02x%02x%02x%02x %02x k4=(%g %g %g %g)\n", g,
+                   slot, (unsigned long long) k_off, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], k4.x, k4.y,
+                   k4.z, k4.w);
+        }
         float a = q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
         float l = wsum(a) * qk_scale;
         if (dist < extent) {
@@ -4457,7 +4701,12 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
             l += wsum(b);
         }
         if (l > -INFINITY) {
-            const float4 v4 = v_load4(vc + head_off, lane);
+            const float4 v4 = kv4 ? kv4_lane4((const uint8_t*) vc + v_off, lane) : v_load4(vc + v_off, lane);
+            if (kv4 && c_kv4_dump_pos >= 0 && pos == c_kv4_dump_pos && lane == 0 && warp == 0) {
+                const uint8_t* vr = (const uint8_t*) vc + v_off;
+                printf("kv4attn v g=%d slot=%d vrow=%02x%02x%02x%02x v4=(%g %g %g %g)\n", g, slot, vr[0], vr[1], vr[2],
+                       vr[3], v4.x, v4.y, v4.z, v4.w);
+            }
             const float m_new = fmaxf(m_w, l);
             const float alpha = (m_w == -INFINITY) ? 0.0f : expf(m_w - m_new);
             const float beta = expf(l - m_new);
@@ -4481,7 +4730,8 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
 template <class KV>
 __global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, const KV* vc, int kv_cap, int H,
                                   int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj, int d_rel,
-                                  int extent, int window, float* part, const int* pos_d) {
+                                  int extent, int window, float* part, const int* pos_d, int kv4 = 0, int row4 = 0,
+                                  int kv4k = 0) {
     if (pos_d) {   // (tokens of a replayed graph: the first's position read here, the keys they may see from it)
         qpos0 = *pos_d;
         k0 = window < (1 << 30) ? max(0, qpos0 - window + 1) : 0;
@@ -4495,7 +4745,7 @@ __global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, 
     const float* qh = q + ((size_t) qi * H + h) * 128;
     const float* rh = r + ((size_t) qi * H + h) * d_rel;
     attn_flash_range(qh, rh, kc, vc, KD, g, kv_cap, k0, j0, j1, qpos, qk_scale, proj, d_rel, extent, window, sm_m,
-                     sm_s, sm_o);
+                     sm_s, sm_o, kv4, row4, kv4k);
     const float M = fmaxf(fmaxf(sm_m[0], sm_m[1]), fmaxf(sm_m[2], sm_m[3]));
     float sum = 0.0f, o = 0.0f;
     if (M > -INFINITY) {
@@ -4547,7 +4797,8 @@ __global__ void mv_blocks_kernel(int type, const uint8_t* W, int N, int K, size_
 template <class KV>
 __global__ void attn_decode_kernel(const float* q, const float* r, const float* sink, const KV* kc, const KV* vc,
                                    int kv_cap, int H, int Hkv, int k0, int nk, int qpos, float qk_scale,
-                                   float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* out) {
+                                   float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* out,
+                                   int kv4 = 0, int row4 = 0, int kv4k = 0) {
     __shared__ float sm_m[4], sm_s[4];
     __shared__ __align__(16) float sm_o[4][128];
     const int h = blockIdx.x, g = h / (H / Hkv), tid = threadIdx.x;
@@ -4555,7 +4806,7 @@ __global__ void attn_decode_kernel(const float* q, const float* r, const float* 
     const float* qh = q + (size_t) h * 128;
     const float* rh = r + (size_t) h * d_rel;
     attn_flash_range(qh, rh, kc, vc, KD, g, kv_cap, k0, 0, nk, qpos, qk_scale, proj, d_rel, extent, window, sm_m, sm_s,
-                     sm_o);
+                     sm_o, kv4, row4, kv4k);
     const float sk = sink[h];
     const float M = fmaxf(sk, fmaxf(fmaxf(sm_m[0], sm_m[1]), fmaxf(sm_m[2], sm_m[3])));
     float den = expf(sk - M), o = 0.0f;
@@ -6743,6 +6994,258 @@ void set_xglobal(int on) {
     cudaMemcpyToSymbol(g_xglobal, &on, sizeof on);
     check("set_xglobal");
 }
+void set_kv4_dump(int pos) {
+    cudaMemcpyToSymbol(c_kv4_dump_pos, &pos, sizeof pos);
+    check("set_kv4_dump");
+}
+void set_kv4_store(int pos) {
+    cudaMemcpyToSymbol(c_kv4_store_pos, &pos, sizeof pos);
+    check("set_kv4_store");
+}
+void set_kv4_mse(int on) {
+    cudaMemcpyToSymbol(g_kv4_mse, &on, sizeof on);
+    check("set_kv4_mse");
+}
+// (IK2_KVAUDIT: the real-data error of the 4-bit pack - the staging rows an actual run produced (the fp8-form K/V the
+//  pack consumes), decoded, quantised at amax/12 and at the MSE-optimal scale, and the per-value relative error
+//  distribution of each.  This is what the codec selftests' synthetic randoms could not say.)
+void kv4_stage_audit(const uint8_t* d8, int n) {
+    std::vector<uint8_t> h((size_t) n);
+    cudaMemcpy(h.data(), d8, (size_t) n, cudaMemcpyDeviceToHost);
+    check("kv4_stage_audit copy");
+    struct Acc {
+        std::vector<float> rel;
+        double se = 0;
+        void add(float e) { rel.push_back(e), se += (double) e * e; }
+    } heur, mse;
+    int nsub = n / 16;
+    for (int sb = 0; sb < nsub; ++sb) {
+        float v[16], amax = 0.0f;
+        for (int i = 0; i < 16; ++i) {
+            v[i] = kv4_e4m3fn(h[(size_t) sb * 16 + i]);
+            amax = std::max(amax, std::fabs(v[i]));
+        }
+        // amax/12
+        {
+            uint8_t blk = kv4_scale_byte(amax / 12.0f);
+            const float sc = ue4m3(blk);
+            for (int i = 0; i < 16; ++i) {
+                const float q = sc > 0 ? std::fabs(v[i]) / sc : 0.0f;
+                int b = 0;
+                float bd = 1e30f;
+                for (int m = 0; m < 8; ++m) {
+                    const float d = std::fabs(q - kv4_code_mag(m));
+                    if (d < bd) bd = d, b = m;
+                }
+                const float got = kv4_code_mag(b) * sc * (v[i] < 0 ? -1.0f : 1.0f);
+                heur.add(amax > 0 ? std::fabs(got - v[i]) / amax : 0.0f);
+            }
+        }
+        // MSE-optimal scale
+        {
+            int bestc = 1;
+            float beste = 1e30f;
+            for (int c = 1; c < 128; ++c) {
+                const float sc = kv4_e4m3fn((uint8_t) c);
+                if (!(sc > 0.0f)) continue;
+                float e2 = 0.0f;
+                for (int i = 0; i < 16; ++i) {
+                    const float q = std::fabs(v[i]) / sc;
+                    int b = 0;
+                    float bd = 1e30f;
+                    for (int m = 0; m < 8; ++m) {
+                        const float d = std::fabs(q - kv4_code_mag(m));
+                        if (d < bd) bd = d, b = m;
+                    }
+                    const float got = kv4_code_mag(b) * sc * (v[i] < 0 ? -1.0f : 1.0f);
+                    e2 += (got - v[i]) * (got - v[i]);
+                }
+                if (e2 < beste) beste = e2, bestc = c;
+            }
+            const float sc = ue4m3((uint8_t) bestc);
+            for (int i = 0; i < 16; ++i) {
+                const float q = sc > 0 ? std::fabs(v[i]) / sc : 0.0f;
+                int b = 0;
+                float bd = 1e30f;
+                for (int m = 0; m < 8; ++m) {
+                    const float d = std::fabs(q - kv4_code_mag(m));
+                    if (d < bd) bd = d, b = m;
+                }
+                const float got = kv4_code_mag(b) * sc * (v[i] < 0 ? -1.0f : 1.0f);
+                mse.add(amax > 0 ? std::fabs(got - v[i]) / amax : 0.0f);
+            }
+        }
+    }
+    auto line = [](const char* what, Acc& a, int nsub) {
+        std::sort(a.rel.begin(), a.rel.end());
+        const size_t n = a.rel.size();
+        const double med = n ? a.rel[n / 2] : 0.0;
+        size_t q25 = 0, q50 = 0;
+        for (float e : a.rel) q25 += e > 0.25f, q50 += e > 0.50f;
+        std::printf("kv4audit %-9s %zu values, median rel %.3f, p90 %.3f, >25%% %.1f%%, >50%% %.1f%%, rms %.4f\n", what, n,
+                    med, n ? a.rel[(size_t) (0.9 * (double) n)] : 0.0, 100.0 * (double) q25 / (double) n,
+                    100.0 * (double) q50 / (double) n, std::sqrt(a.se / (double) std::max<size_t>(1, n)));
+        (void) nsub;
+    };
+    line("amax/12", heur, nsub);
+    line("MSE", mse, nsub);
+    std::fflush(stdout);
+}
+// (IK2_KV4's codec, phase 1: public entry points.  Inert - the cache does not use it yet; the selftest is its gate.)
+size_t kv4_row_bytes(int KD) { return (size_t) ((KD + 63) / 64) * 36; }
+void kv4_unpack_dev(const uint8_t* in, float* out, int n) {   // (phase 2's reader: the window decode)
+    kv4_unpack_kernel<<<(n + 127) / 128, 128>>>(in, out, n);
+    check("kv4_unpack");
+}
+void kv4_pack_host(const float* x, uint8_t* out, int n) {
+    for (int b = 0; b < n / 64; ++b) kv4_pack_block(x + (size_t) b * 64, out + (size_t) b * 36);
+}
+// (the write path's entry: the chunk's E4M3 staging -> the packed store, the rows mapped to their slots)
+void kv4_pack_rows(const uint8_t* src8, uint8_t* dst4, int T, int KVh, int D, int kv_cap, int pos0, int row4,
+                   cudaStream_t s) {
+    if (T <= 0 || D % 16 || D % 64) {
+        std::fprintf(stderr, "ik2::k::kv4_pack_rows: D %d (needs a multiple of 64: the 4-bit block is 64 values)\n", D);
+        std::abort();
+    }
+    const int n = T * KVh * (D / 16);
+    kv4_pack_rows_kernel<<<(n + 127) / 128, 128, 0, s>>>(src8, dst4, T, KVh, D, kv_cap, pos0, row4);
+    check("kv4_pack_rows");
+}
+// (the prefill's reader: nk rows of the packed store into the f16 window the chunked GEMM path already takes)
+void unpack_kv4_to_f16(const uint8_t* kc4, const uint8_t* vc4, int kv_cap, int k0, int nk, int KD, int row4,
+                       float k_inv, float v_inv, uint16_t* k16, uint16_t* v16, cudaStream_t s, int kv4k) {
+    if (nk <= 0 || KD % 64) {
+        std::fprintf(stderr, "ik2::k::unpack_kv4: nk %d, KD %d (needs KD a multiple of 64)\n", nk, KD);
+        std::abort();
+    }
+    const int n = nk * (KD / 16);   // (a thread a sub-block: the inverse butterfly needs all 16 values)
+    unpack_kv4_to_f16_kernel<<<(n + 255) / 256, 256, 0, s>>>(kc4, vc4, kv_cap, k0, nk, KD, row4, k_inv, v_inv, k16,
+                                                            v16, kv4k);
+    check("unpack_kv4_to_f16");
+}
+// (the write path's geometry, end to end: a staging row of KVh heads x D values -> kv4_pack_rows -> the packed row, then
+//  every head read the way the decode kernel reads it (kv4_lane4 at that head's base) against the staging's own value.
+//  This is the check that catches a block-offset or head-stride error - the two things that made the first end-to-end
+//  run word-salad - and it reports the worst error as a fraction of the sub-block's scale.)
+int kv4_rows_selftest(int KVh, int D, float* worst_rel) {
+    const int KD = KVh * D;
+    if (D % 64 || KD % 64) return -1;
+    const size_t row4 = (size_t) ((KD + 63) / 64) * 36;
+    std::vector<uint8_t> st((size_t) KD), pk((size_t) row4);
+    uint64_t s = 4242;
+    auto rnd = [&] {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        return (float) ((double) (s >> 11) / 9007199254740992.0);
+    };
+    for (int i = 0; i < KD; ++i) {   // (fp8 values as the staging holds them: E4M3 of +-0.02 .. 1.75)
+        const float v = (rnd() * 2.0f - 1.0f) * (0.02f + 1.73f * rnd());
+        uint8_t code = 0;
+        float bd = 1e30f;
+        for (int c = 1; c < 128; ++c) {
+            const float d = std::fabs(kv4_e4m3fn((uint8_t) c) - std::fabs(v));   // (E4M3FN codes: the staging's own format)
+            if (d < bd) bd = d, code = (uint8_t) c;
+        }
+        st[(size_t) i] = (uint8_t) (code | (v < 0 ? 0x80 : 0));
+    }
+    uint8_t *ds = nullptr, *dp = nullptr;
+    cudaMalloc(&ds, (size_t) KD);
+    cudaMalloc(&dp, row4);
+    cudaMemcpy(ds, st.data(), (size_t) KD, cudaMemcpyHostToDevice);
+    kv4_pack_rows(ds, dp, 1, KVh, D, 0, 0, (int) row4, 0);
+    cudaDeviceSynchronize();   // (the read-back must follow the pack: an earlier version of this test read before it,
+    check("kv4_rows pack");    //  saw cudaMalloc's zeros, and that was mistaken for the pack writing nothing)
+    cudaMemcpy(pk.data(), dp, row4, cudaMemcpyDeviceToHost);
+    check("kv4_rows read back");
+    float worst = 0.0f;
+    bool warned = false;
+    double se = 0.0;
+    size_t nval = 0;
+    for (int g = 0; g < KVh; ++g)
+        for (int sb = 0; sb < D / 16; ++sb) {
+            // (one domain, honestly: the staging's own 16 values and their own max - the rotated codec's error is measured
+            //  in the domain the pack was given, so the ratio means what it says)
+            float submax = 0.0f;
+            float want16[16];
+            for (int j = 0; j < 16; ++j) {
+                want16[j] = kv4_e4m3fn(st[(size_t) g * D + sb * 16 + j]);
+                submax = std::max(submax, std::fabs(want16[j]));
+            }
+            if (submax <= 0.0f) continue;
+            const uint8_t* blk = pk.data() + (size_t) g * (D / 64) * 36 + (size_t) (sb >> 2) * 36;
+            float got16[16];
+            kv4_unpack_subblock(blk, sb & 3, got16);   // (the full inverse: both sides in the staging's domain)
+            for (int j = 0; j < 16; ++j) {
+                const float rel = std::fabs(got16[j] - want16[j]) / submax;
+                se += (double) rel * rel, ++nval;
+                if (rel > worst) worst = rel;
+                if (rel > 0.35f && !warned) {   // (the first value past a third of its sub-block's peak)
+                    warned = true;
+                    std::printf("  kv4_rows: g=%d sb=%d j=%d got=%.4f want=%.4f (rel %.2f)\n", g, sb, j, got16[j],
+                                want16[j], rel);
+                    std::fflush(stdout);
+                }
+            }
+        }
+    const double rms = std::sqrt(se / (double) std::max<size_t>(1, nval));
+    if (worst_rel) *worst_rel = (float) rms;
+    cudaFree(ds);
+    cudaFree(dp);
+    return 0;
+}
+int kv4_lane_align_selftest() {   // (the kernel's `lane*4` read against the flat decode: 0 mismatches is the gate)
+    std::vector<uint8_t> row(2 * 36);   // (a head's 128 values: two blocks)
+    uint64_t s = 999;
+    auto rnd = [&] {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        return (float) ((double) (s >> 11) / 9007199254740992.0);
+    };
+    float vals[128];
+    for (int i = 0; i < 128; ++i) vals[i] = (rnd() * 2.0f - 1.0f) * (0.01f + rnd());
+    for (int b = 0; b < 2; ++b) kv4_pack_block(vals + b * 64, row.data() + b * 36);
+    std::vector<float> flat(128);
+    for (int i = 0; i < 128; ++i) flat[(size_t) i] = kv4_unpack_value(row.data() + (i >> 6) * 36, i & 63);
+    int bad = 0;
+    for (int lane = 0; lane < 32; ++lane) {
+        const float4 v = kv4_lane4(row.data(), lane);
+        const float fl[4] = {v.x, v.y, v.z, v.w};
+        for (int k = 0; k < 4; ++k)
+            if (fl[k] != flat[(size_t) (lane * 4 + k)]) ++bad;
+    }
+    return bad;
+}
+void kv4_selftest(float* max_abs4, float* max_abs8, int n) {    // synthetic KV values: a token's K rows span ~1e-2..1 with signs; the engine stores them at k_scale = 16.
+    std::vector<float> x((size_t) n), u4((size_t) n), u8((size_t) n);
+    uint64_t s = 12345;
+    auto rnd = [&] {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        return (float) ((double) (s >> 11) / 9007199254740992.0);
+    };
+    for (int i = 0; i < n; ++i) x[(size_t) i] = (rnd() * 2.0f - 1.0f) * std::pow(10.0f, -2.0f * rnd());
+    std::vector<uint8_t> p((size_t) (n / 64) * 36);
+    kv4_pack_host(x.data(), p.data(), n);
+    // (the decode runs on the device: its buffers must be device ones.  The first version of this test passed the host
+    //  vectors and the kernel wrote to host memory - an illegal access that landed asynchronously and surfaced at the
+    //  next CUDA call, which is how it came to be blamed on kv4_pack_rows.)
+    float* d4dev = nullptr;
+    uint8_t* dpdev = nullptr;
+    cudaMalloc(&d4dev, (size_t) n * 4);
+    cudaMalloc(&dpdev, p.size());
+    cudaMemcpy(dpdev, p.data(), p.size(), cudaMemcpyHostToDevice);
+    kv4_unpack_dev(dpdev, d4dev, n);
+    cudaDeviceSynchronize();
+    check("kv4_selftest decode");
+    cudaMemcpy(u4.data(), d4dev, (size_t) n * 4, cudaMemcpyDeviceToHost);
+    cudaFree(d4dev);
+    cudaFree(dpdev);
+    for (int i = 0; i < n; ++i)   // (fp8's own round trip, the reference this has to live beside)
+        u8[(size_t) i] = ue4m3(kv4_scale_byte(x[(size_t) i] * 16.0f)) * (1.0f / 16.0f);
+    float d4 = 0.0f, d8 = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        d4 = std::max(d4, std::fabs(u4[(size_t) i] - x[(size_t) i]));
+        d8 = std::max(d8, std::fabs(u8[(size_t) i] - x[(size_t) i]));
+    }
+    *max_abs4 = d4, *max_abs8 = d8;
+}
 void set_tune_fma(int on) {
     cudaMemcpyToSymbol(g_tune_fma, &on, sizeof on);
     check("set_tune_fma");
@@ -6922,12 +7425,17 @@ void prep_qkv_r_f16(float* q, const float* q_clip, const float* k_in, uint16_t* 
 void prep_qkv_r_fp8(float* q, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in, uint8_t* vc,
                     float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip,
                     float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
-                    float k_scale, float v_scale, cudaStream_t s) {
+                    float k_scale, float v_scale, cudaStream_t s, int kv4, int kv4k) {
     if (T <= 0) return;
     const int total = T * (2 * H + 2 * KV);
-    prep_qkv_r_impl_kernel<uint8_t><<<(unsigned) total, 32, 0, s>>>(
+    prep_qkv_r_impl_kernel<uint8_t><<<(unsigned) total, 32, 0, s>>>(   // (IK2_KV4: kv4 writes the staging, per token)
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
-        pos0, kv_cap, k_scale, v_scale, nullptr, nullptr, nullptr, nullptr, 0, nullptr);
+        pos0, kv_cap, k_scale, v_scale, nullptr, nullptr, nullptr, nullptr, 0, nullptr, 0, 0, kv4, kv4k);
+    //  ^ the trailing 0, 0, kv4: q_ld and r_ld take their defaults (H*D and H*d_rel) and kv4 goes where it is declared.
+    //    It used to be passed one slot early, so the kernel saw kv4 = 0 and a q_ld of 1 - the store then wrote at the
+    //    SLOT index (fine for a prompt, where slot == t, so every prefill dump looked perfect) and the Q rows of a
+    //    multi-token chunk overwrote each other, while the decode's T=1 store landed at staging row pos instead of row 0
+    //    and kv4_pack_rows packed uninitialised bytes into the 4-bit row.  That is the degenerate decode text.
     check("prep_qkv_r_fp8");
 }
 
@@ -6936,6 +7444,7 @@ void attn_multi_impl(const float* q, const float* r, const float* sink, const KV
                      int nq, int H, int Hkv, int k0, int nk, int qpos0, float qk_scale, float v_inv_scale,
                      const float* proj, int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s) {
     if (d_rel > 32) {
+
         std::fprintf(stderr, "ik2::k::attn_multi: d_rel %d\n", d_rel);
         std::abort();
     }
@@ -6999,7 +7508,8 @@ void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* 
 template <class KV>
 void attn_decode_impl(const float* q, const float* r, const float* sink, const KV* kc, const KV* vc, int kv_cap, int H,
                       int Hkv, int D, int k0, int nk, int qpos, float qk_scale, float v_inv_scale, const float* proj,
-                      int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s) {
+                      int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s, int kv4 = 0,
+                      int row4 = 0, int kv4k = 0) {
     if (D != 128 || d_rel > 32) {
         std::fprintf(stderr, "ik2::k::attn_decode: D %d, d_rel %d\n", D, d_rel);
         std::abort();
@@ -7008,13 +7518,13 @@ void attn_decode_impl(const float* q, const float* r, const float* sink, const K
     const int P = std::min(128, std::max(1, (nk + 63) / 64));
     if (P == 1) {
         attn_decode_kernel<KV><<<H, 128, 0, s>>>(q, r, sink, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale,
-                                                   v_inv_scale, proj, d_rel, extent, window, out);
+                                                   v_inv_scale, proj, d_rel, extent, window, out, kv4, row4, kv4k);
         check("attn_decode");
         return;
     }
     float* part = scratch;
     attn_split_kernel<KV><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel,
-                                                      extent, window, part, nullptr);
+                                                      extent, window, part, nullptr, kv4, row4, kv4k);
     check("attn_decode_split");
     attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out);
     check("attn_decode_combine");
@@ -7037,9 +7547,9 @@ void attn_decode_f16(const float* q, const float* r, const float* sink, const ui
 void attn_decode_fp8(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                      int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale,
                      float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
-                     float* out, cudaStream_t s) {
+                     float* out, cudaStream_t s, int kv4, int row4, int kv4k) {
     attn_decode_impl(q, r, sink, kc, vc, kv_cap, H, Hkv, D, k0, nk, qpos, qk_scale, v_inv_scale, proj, d_rel, extent,
-                     window, scratch, out, s);
+                     window, scratch, out, s, kv4, row4, kv4k);
 }
 
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
@@ -7480,5 +7990,27 @@ void experts_down_mem(const uint8_t* const* blob, const int* n, const int* row, 
 bool experts_block_exact() { return experts_mma_split(true) == 8 && experts_mma_split(false) == 4; }
 
 }  // namespace ik2::k
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 

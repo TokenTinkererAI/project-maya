@@ -69,6 +69,7 @@ static inline int munmap(void*, size_t) { return 0; }
 #endif
 
 #include <algorithm>
+#include <numeric>
 #include <atomic>
 #include <cctype>
 #include <filesystem>
@@ -433,7 +434,26 @@ bool g_dense_q8 = false;
 // The KV cache in FP16 (IK2_KV=fp8: E4M3, half the bytes).  Against ref/inkling2.py over 48 tokens FP16 kept every
 // top-1 token (KL mean 8.5e-4) and FP8 changed 5 (KL 8.3e-3): Inkling's router is full of near-ties, so FP8's 1.5% in
 // layer 0's attention output already moves 7 of 48 tokens' experts.  The full layers' cache is 32 KB a token in FP16.
+__host__ __device__ __forceinline__ float e4m3fn_host(uint8_t q) {   // (the dumps' fp8 decode: pure bits, either side)
+    const int e = (q >> 3) & 0xF, m = q & 7;
+    float mag;
+    if (e) {
+        union { uint32_t u; float f; } b2;
+        b2.u = (uint32_t) ((e + 120) << 23) | ((uint32_t) m << 20);
+        mag = b2.f;
+    } else {
+        mag = (float) m * (1.0f / 512.0f);
+    }
+    return (q & 0x80) ? -mag : mag;
+}
 bool g_kv_fp8 = false;
+// (IK2_KV4: the KV cache in the 4-bit block format - 36 bytes a 64 values, four ue4m3 scales and E2M1 nibbles - which is
+//  56.2% of fp8's bytes.  Storage, the write's pack, the decode's inline read and the prefill's unpack all key off this
+//  one flag; the paths it does not serve yet refuse by name (see main's gate).)
+bool g_kv4 = false;
+// (IK2_KV4V: the same format on the V side only - K stays fp8 at KD bytes a row, V takes the 4-bit row.  77% of fp8's
+//  bytes.  K4 and K8V4 are the two modes; g_kv4v is "V is packed" and is true for both, g_kv4 is "K is packed too".)
+bool g_kv4v = false;
 // Q8_0 blocks (2 bytes of FP16 scale, 32 int8 values) taken apart into m.q8 / m.q8d on the device; false if the
 // matrix cannot be kept so (another type, or K not a multiple of 128)
 bool upload_planar(Mat& m, const std::vector<const uint8_t*>& parts, const std::vector<size_t>& part_values) {
@@ -1299,6 +1319,8 @@ struct Work {
     float *blocks;      // [n_blk][blk_ld][C]
     uint16_t *x16, *xk16, *xv16, *xq16_sup = nullptr;
     uint16_t *kv_k16 = nullptr, *kv_v16 = nullptr;
+    //  kv4_pack_rows packs them into the 4-bit store; [Tm][KVh][D] bytes each)
+    uint8_t *kv_w8k = nullptr, *kv_w8v = nullptr;
     int kv_tmp_cap = 0;
     int* pos;
     float* rlog;
@@ -1716,13 +1738,99 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const float v_scale = 32.0f;
     const float k_inv = 1.0f / k_scale, v_inv = 1.0f / v_scale;
     if (g_kv_fp8) {
-        k::prep_qkv_r_fp8(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
-                          c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
-                          Ly.kv_cap, k_scale, v_scale, g_s);
+        // (IK2_KV4 / IK2_KV4V: the store kernels write the chunk's packed SIDE into the fp8 staging - per token, no slot
+        //  wrap - and the pack maps it to its slot in the 4-bit rows.  The staging's values are the same scaled ones fp8
+        //  holds, so the reader's k_inv / v_inv apply unchanged.  The two sides are independent: IK2_KV4 packs both,
+        //  IK2_KV4V packs V and K keeps its fp8 row (written straight to kc8, slot-indexed, as fp8 always did).)
+        const int row4 = g_kv4v ? (int) k::kv4_row_bytes(KD) : 0;
+        k::prep_qkv_r_fp8(q_p, Ly.q_clip, W.kconv, g_kv4 ? W.kv_w8k : Ly.kc8, W.vconv, g_kv4v ? W.kv_w8v : Ly.vc8, r_p,
+                          Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps,
+                          Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0, Ly.kv_cap, k_scale, v_scale, g_s,
+                          g_kv4v ? 1 : 0, g_kv4 ? 1 : 0);
+        if (g_kv4v) {
+            if (g_kv4)
+                k::kv4_pack_rows(W.kv_w8k, Ly.kc8, T, c.KV, c.D, Ly.sliding ? Ly.kv_cap : 0, pos0, row4, g_s);
+            k::kv4_pack_rows(W.kv_w8v, Ly.vc8, T, c.KV, c.D, Ly.sliding ? Ly.kv_cap : 0, pos0, row4, g_s);
+            // (IK2_KVDUMP: the host's copy of the rows for the chosen position, from the store the pack just wrote - the
+            //  other half of the geometry check; the kernel's own print for the same pos goes to the same log)
+            static const char* dp_env = getenv("IK2_KVDUMP") ? getenv("IK2_KVDUMP") : getenv("IK2_KV4STORE");
+            static const int dump_pos = dp_env ? std::atoi(dp_env) : -1;
+            static bool dumped = false;
+            static const bool audit = getenv("IK2_KVAUDIT") && std::atoi(getenv("IK2_KVAUDIT"));
+            static bool audited = false;
+            if (audit && !audited) {   // (IK2_KVAUDIT: the real staging's error distribution, once, on the first visit)
+                audited = true;
+                CU(cudaStreamSynchronize(g_s));
+                k::kv4_stage_audit(W.kv_w8v, T * c.KV * c.D);
+            }
+            if (dump_pos >= 0 && !dumped && pos0 <= dump_pos && dump_pos < pos0 + T) {
+                dumped = true;
+                CU(cudaStreamSynchronize(g_s));
+                const int slot = Ly.sliding ? dump_pos % Ly.kv_cap : dump_pos;
+                const int krow_b = g_kv4 ? row4 : (int) (c.KV * c.D);   // (K's own row: 4-bit when packed, else fp8)
+                std::vector<uint8_t> krow((size_t) krow_b), vrow((size_t) row4);
+                CU(cudaMemcpy(krow.data(), Ly.kc8 + (size_t) slot * (size_t) krow_b, krow.size(), cudaMemcpyDeviceToHost));
+                CU(cudaMemcpy(vrow.data(), Ly.vc8 + (size_t) slot * (size_t) row4, vrow.size(), cudaMemcpyDeviceToHost));
+                std::printf("kv4host %s layer=%d T=%d sliding=%d kv_cap=%d pos=%d slot=%d row4=%d krow=%d\n",
+                            g_kv4 ? "K4V4" : "K8V4", l, T, (int) Ly.sliding, Ly.kv_cap, dump_pos, slot, row4, krow_b);
+                for (int g = 0; g < c.KV; ++g) {
+                    const uint8_t* r = krow.data() + (g_kv4 ? (size_t) (g * c.D / 64) * 36 : (size_t) g * c.D);
+                    const uint8_t* w = vrow.data() + (size_t) (g * c.D / 64) * 36;
+                    std::printf("kv4host g=%d Krow=%02x%02x%02x%02x Vrow=%02x%02x%02x%02x\n", g, r[0], r[1], r[2], r[3],
+                                w[0], w[1], w[2], w[3]);
+                }
+                // (the staging ground truth: the fp8-form bytes the pack consumed.  Under K8V4 only V is staged, so K's
+                //  ground truth is the fp8 row the kv4fp8 dump below prints from the same slot.)
+                {
+                    std::vector<uint8_t> stg((size_t) c.KV * c.D);
+                    CU(cudaMemcpy(stg.data(), W.kv_w8v + (size_t) (dump_pos - pos0) * c.KV * c.D, stg.size(),
+                                  cudaMemcpyDeviceToHost));
+                    for (int g = 0; g < 4 && g < c.KV; ++g) {
+                        const uint8_t* s = stg.data() + (size_t) g * c.D;
+                        std::printf("kv4host Vstage g=%d %02x%02x%02x%02x k=%g %g %g %g\n", g, s[0], s[1], s[2], s[3],
+                                    e4m3fn_host(s[0]), e4m3fn_host(s[1]), e4m3fn_host(s[2]), e4m3fn_host(s[3]));
+                    }
+                }
+                if (g_kv4) {   // (K4V4: K's staging is a separate read)
+                    std::vector<uint8_t> stg((size_t) c.KV * c.D);
+                    CU(cudaMemcpy(stg.data(), W.kv_w8k + (size_t) (dump_pos - pos0) * c.KV * c.D, stg.size(),
+                                  cudaMemcpyDeviceToHost));
+                    for (int g = 0; g < 4 && g < c.KV; ++g) {
+                        const uint8_t* s = stg.data() + (size_t) g * c.D;
+                        std::printf("kv4host Kstage g=%d %02x%02x%02x%02x k=%g %g %g %g\n", g, s[0], s[1], s[2], s[3],
+                                    e4m3fn_host(s[0]), e4m3fn_host(s[1]), e4m3fn_host(s[2]), e4m3fn_host(s[3]));
+                    }
+                }
+                std::fflush(stdout);
+            }
+        }
     } else {
         k::prep_qkv_r_f16(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
                           Ly.kv_cap, g_s);
+    }
+    if (g_kv_fp8 && !g_kv4) {
+        // (IK2_KVDUMP in the fp8 path: the K row this visit's store wrote for the dump position - the ground truth the
+        //  4-bit staging must equal, so "the decode's write stores the right K" is a byte comparison, not an inference.
+        //  Under IK2_KV4V V is packed, so only K is read here; the V row comes from the kv4host dump above.)
+        static const int dpos = getenv("IK2_KVDUMP") ? std::atoi(getenv("IK2_KVDUMP")) : -1;
+        static bool done_fp8 = false;
+        if (dpos >= 0 && !done_fp8 && pos0 <= dpos && dpos < pos0 + T) {
+            done_fp8 = true;
+            CU(cudaStreamSynchronize(g_s));
+            const int slot = Ly.sliding ? dpos % Ly.kv_cap : dpos;
+            for (int g = 0; g < 4 && g < c.KV; ++g) {
+                uint8_t kb[4] = {}, vb[4] = {};
+                CU(cudaMemcpy(kb, Ly.kc8 + (size_t) slot * c.KV * c.D + (size_t) g * c.D, 4, cudaMemcpyDeviceToHost));
+                if (!g_kv4v)
+                    CU(cudaMemcpy(vb, Ly.vc8 + (size_t) slot * c.KV * c.D + (size_t) g * c.D, 4,
+                                  cudaMemcpyDeviceToHost));
+                std::printf("kv4fp8 g=%d slot=%d k=%02x%02x%02x%02x (%.4g %.4g %.4g %.4g) v=%02x%02x%02x%02x\n", g, slot,
+                            kb[0], kb[1], kb[2], kb[3], e4m3fn_host(kb[0]), e4m3fn_host(kb[1]), e4m3fn_host(kb[2]),
+                            e4m3fn_host(kb[3]), vb[0], vb[1], vb[2], vb[3]);
+            }
+            std::fflush(stdout);
+        }
     }
 
     const int extent = Ly.sliding ? c.extent_swa : c.extent;
@@ -1735,12 +1843,13 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     if (T == 1) {
         if (g_kv_fp8) {
             k::attn_decode_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0,
-                               qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+                               qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s,
+                               g_kv4v ? 1 : 0, g_kv4v ? (int) k::kv4_row_bytes(KD) : 0, g_kv4 ? 1 : 0);
         } else {
             k::attn_decode_f16(q_p, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0, qk_scale,
                                Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         }
-    } else if (T <= 8 && g_group && g_group_attn) {
+    } else if (T <= 8 && g_group && g_group_attn && !g_kv4v) {   // (IK2_KV4: the chunked path below reads 4-bit)
         if (g_kv_fp8) {
             k::attn_multi_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, T, c.H, c.KV, k0, nk, pos0,
                               qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
@@ -1766,7 +1875,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                   c.d_rel, Ly.rel_proj, extent, window, sink_p + (size_t) ts * c.H, g_s);
             }
         };
-        if (g_flash && c.D == 128 && W.relb && extent <= W.relb_ext) {
+        if (g_flash && !g_kv4v && c.D == 128 && W.relb && extent <= W.relb_ext) {   // (IK2_KV4: the chunked path)
             if (!g_n_sm) CU(cudaDeviceGetAttribute(&g_n_sm, cudaDevAttrMultiProcessorCount, Ly.dev));
             for (int ts = 0; ts < T; ts += Work::kRelbRows) {
                 const int Tq = std::min(Work::kRelbRows, T - ts);
@@ -1776,6 +1885,8 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                 CUDA_R_32F, extent, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
                 const int k_lo = Ly.sliding ? std::max(0, pos0 + ts - c.window + 1) : 0;
                 const int ns = k::attn_flash_splits(Tq, c.H, pos0 + ts + Tq - k_lo, g_n_sm);
+                if (g_kv4v)   // (IK2_KV4/KV4V: the flash reader is not wired; the chunked path below is)
+                    die("IK2_KV4/KV4V: attn_flash_fp8 does not read the 4-bit cache yet");
                 if (g_kv_fp8)
                     k::attn_flash_fp8(W.x16 + (size_t) ts * HD, HD, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, Tq,
                                       pos0 + ts, qk_scale * k_inv, v_inv, W.relb, extent, window,
@@ -1794,10 +1905,20 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             const int nk_s = pos0 + ts + Tq - k0_s;
             const long long qn = (long long) Tq * nk_s;
             if (g_kv_fp8) {
+                // (IK2_KV4: the same windows, read 4-bit - the packed row's blocks decode straight into the f16 window, so
+                //  the chunked GEMM path below is unchanged)
+                const int row4_p = (int) k::kv4_row_bytes(KD);
+                auto unpack_kv = [&](int kk0, int nnk) {
+                    if (g_kv4v)   // (K8V4: K's row comes out as fp8, V's from the packed blocks - one kernel, two readers)
+                        k::unpack_kv4_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, kk0, nnk, KD, row4_p, k_inv, v_inv,
+                                             W.kv_k16, W.kv_v16, g_s, g_kv4 ? 1 : 0);
+                    else
+                        k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, kk0, nnk, KD, k_inv, v_inv, W.kv_k16,
+                                                W.kv_v16, g_s);
+                };
                 for (int k_off = 0; k_off < nk_s; k_off += W.kv_tmp_cap) {
                     const int nk_c = std::min(W.kv_tmp_cap, nk_s - k_off);
-                    k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv, W.kv_k16,
-                                            W.kv_v16, g_s);
+                    unpack_kv(k0_s + k_off, nk_c);
                     for (int g = 0; g < c.KV; ++g) {
                         const uint16_t* Kp = W.kv_k16 + (size_t) g * c.D;
                         CB(cublasGemmStridedBatchedEx(
@@ -1811,8 +1932,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                 for (int k_off = 0; k_off < nk_s; k_off += W.kv_tmp_cap) {
                     const int nk_c = std::min(W.kv_tmp_cap, nk_s - k_off);
                     if (nk_s > W.kv_tmp_cap) {
-                        k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv,
-                                                W.kv_k16, W.kv_v16, g_s);
+                        unpack_kv(k0_s + k_off, nk_c);
                     }
                     const float beta = k_off == 0 ? zero : one;
                     for (int g = 0; g < c.KV; ++g) {
@@ -2831,8 +2951,11 @@ struct LendSlot {
 struct LendState {
     bool on = false;
     std::vector<uint8_t*> buf;           // the full visits' K and V
-    size_t buf_bytes = 0, row_bytes = 0; // (each buffer: kv_cap rows of row_bytes)
-    std::vector<size_t> top;             // [buf] the lowest byte lent (buf_bytes: none)
+    // (the row size and the size are PER BUFFER: under IK2_KV4V a K row is KD bytes and a V row is (KD/64)*36, and the
+    //  two planes are separate lend buffers, so one global row size would size one of them wrongly)
+    std::vector<size_t> row;             // [buf] a row's bytes
+    std::vector<size_t> bb;              // [buf] the buffer's bytes (kv_cap rows of `row`)
+    std::vector<size_t> top;             // [buf] the lowest byte lent (bb[buf]: none)
     std::vector<LendSlot> slots;
     std::vector<const uint8_t*> ptr;     // [n_layer * E] the lent copy (landed) or null
     std::vector<char> placed;            // [n_layer * E] a slot of its own (any state)
@@ -2875,12 +2998,18 @@ void lend_init(Model& M) {
         if (M.L[Vi.l].sliding) continue;
         uint8_t* k = g_kv_fp8 ? Vi.kc8 : (uint8_t*) Vi.kc;
         uint8_t* v = g_kv_fp8 ? Vi.vc8 : (uint8_t*) Vi.vc;
+        // (IK2_KV4 / IK2_KV4V: a 4-bit row is (KD/64)*36 whole blocks, so a row is still one addressable span and
+        //  lending copies it as it copies an fp8 row - no format tag, no per-slot special case.  The two sides are
+        //  independent, so each buffer carries its own row size.)
+        const size_t krow = g_kv4 ? k::kv4_row_bytes(KD) : (size_t) KD * (g_kv_fp8 ? 1 : 2);
+        const size_t vrow = g_kv4v ? k::kv4_row_bytes(KD) : (size_t) KD * (g_kv_fp8 ? 1 : 2);
         g_lend.buf.push_back(k), g_lend.buf.push_back(v);
-        g_lend.row_bytes = KD * (g_kv_fp8 ? 1 : 2);
-        g_lend.buf_bytes = (size_t) Vi.kv_cap * g_lend.row_bytes;
+        g_lend.row.push_back(krow), g_lend.row.push_back(vrow);
+        g_lend.bb.push_back((size_t) Vi.kv_cap * krow), g_lend.bb.push_back((size_t) Vi.kv_cap * vrow);
     }
     if (g_lend.buf.empty()) return;
-    g_lend.top.assign(g_lend.buf.size(), g_lend.buf_bytes & ~(size_t) 255);
+    g_lend.top.resize(g_lend.buf.size());
+    for (size_t b = 0; b < g_lend.buf.size(); ++b) g_lend.top[b] = g_lend.bb[b] & ~(size_t) 255;
     g_lend.ptr.assign((size_t) c.n_layer * c.E, nullptr);
     g_lend.placed.assign((size_t) c.n_layer * c.E, 0);
     CU(cudaStreamCreateWithFlags(&g_lend.st, cudaStreamNonBlocking));
@@ -2904,7 +3033,8 @@ void lend_init(Model& M) {
                     g_elastic_round);
     }
     std::printf("kv lending: %zu buffers of %.2f GiB lend the rows no position has reached to experts (%d positions "
-                "kept free)\n", g_lend.buf.size(), (double) g_lend.buf.size() * g_lend.buf_bytes / 1073741824.0,
+                "kept free)\n", g_lend.buf.size(),
+                (double) (std::accumulate(g_lend.bb.begin(), g_lend.bb.end(), (size_t) 0)) / 1073741824.0,
                 kLendRoom);
 }
 
@@ -2980,8 +3110,8 @@ void lend_back(Model& M, int p) {
     for (const auto& sl : drop)
         if (sl.state == 2)
             CU(cudaMemsetAsync(g_lend.buf[sl.buf] + sl.lo, 0,
-                               std::min(M.L[sl.key / c.E].slot_bytes, g_lend.buf_bytes - sl.lo), g_s));
-    std::fill(g_lend.top.begin(), g_lend.top.end(), g_lend.buf_bytes & ~(size_t) 255);
+                std::min(M.L[sl.key / c.E].slot_bytes, g_lend.bb[sl.buf] - sl.lo), g_s));
+    for (size_t b = 0; b < g_lend.top.size(); ++b) g_lend.top[b] = g_lend.bb[b] & ~(size_t) 255;
     g_lend.floor = 1 << 30;
     for (const auto& sl : keep) {
         g_lend.top[sl.buf] = std::min(g_lend.top[sl.buf], sl.lo);
@@ -3001,11 +3131,12 @@ void lend_grow(Model& M, int end, int max_new = 0, size_t min_room = (size_t) 1 
     const Config& c = M.c;
     const int64_t target = (int64_t) end + kLendRoom;
     lend_back(M, (int) std::min<int64_t>(target, 1 << 30));
-    const size_t lo_min = (size_t) target * g_lend.row_bytes;
-    if (lo_min >= g_lend.buf_bytes) return;
-    size_t room = 0;
-    for (size_t t : g_lend.top) room += t > lo_min ? t - lo_min : 0;
-    if (room < min_room && !g_lend.slots.empty()) return;
+    size_t room = 0;   // (per buffer: the room above its own row-sized floor)
+    for (size_t b = 0; b < g_lend.top.size(); ++b) {
+        const size_t lo_min_b = (size_t) target * g_lend.row[b];
+        room += g_lend.top[b] > lo_min_b ? g_lend.top[b] - lo_min_b : 0;
+    }
+    if (room == 0 && !g_lend.slots.empty()) return;
     ExpertCache& EC = g_dev[0].EC;
     std::vector<double> val((size_t) c.n_layer * c.E, 0.0);
     if (!g_lend.value.empty()) val = g_lend.value;
@@ -3035,11 +3166,12 @@ void lend_grow(Model& M, int end, int max_new = 0, size_t min_room = (size_t) 1 
         for (size_t b = 0; b < g_lend.buf.size(); ++b) {
             if (g_lend.top[b] < sb) continue;
             const size_t lo = (g_lend.top[b] - sb) & ~(size_t) 255;
-            if (lo >= lo_min && (best < 0 || lo > best_lo)) best = (int) b, best_lo = lo;
+            const size_t lo_min_b = (size_t) target * g_lend.row[b];   // (this buffer's own row size)
+            if (lo >= lo_min_b && (best < 0 || lo > best_lo)) best = (int) b, best_lo = lo;
         }
         if (best < 0) break;
         LendSlot sl;
-        sl.key = key, sl.buf = best, sl.lo = best_lo, sl.pos_lo = (int) (best_lo / g_lend.row_bytes);
+        sl.key = key, sl.buf = best, sl.lo = best_lo, sl.pos_lo = (int) (best_lo / g_lend.row[best]);
         g_lend.top[best] = best_lo;
         g_lend.floor = std::min(g_lend.floor, sl.pos_lo);
         g_lend.placed[key] = 1;
@@ -3294,6 +3426,10 @@ bool lane_init(Model& M, const std::string& want, int threads) {
 // one token through the resident path: its logits appended to logits_out (kLogits) or its argmax (kArgmax)
 void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>& logits_out,
                 std::vector<int>* argmax_out) {
+    // (IK2_KV4: the resident token path reads the cache through attn_decode_fp8_at / the mma kernel, neither of which
+    //  decodes 4-bit rows yet - refuse by name rather than read them as fp8)
+    if (g_kv4v) die("IK2_KV4/KV4V: the resident/graph token path (attn_decode_fp8_at, attn_decode_mma_fp8) does not read the "
+                   "4-bit cache yet; run the host path (IK2_POP_OUT=1 with IK2_CPU_FRAC>0)");
     const Config& c = M.c;
     Work& W = dev_work(0);
     lend_check(M, pos + 1, true);   // (IK2_KVLEND: a token's start)
@@ -5335,9 +5471,65 @@ void check_preview(int n_gpu, bool serve) {
     CU(cudaSetDevice(0));
 }
 
+// ---- --score: teacher-forced scoring ----------------------------------------------------------------------------
+// (One forward over the sequence with all_logits, then per position: the softmax's top 32, the logprob assigned to the
+//  token that ACTUALLY follows, and the NLL.  The forward machinery, the logits and the softcap are generation's own -
+//  nothing new is computed, so a fixed text scored twice (fp8, then a 4-bit cache) is a like-for-like comparison.
+//  The file is one line a position plus a summary; the top-32 is exact (the softmax is normalised over the whole
+//  vocabulary here), but a KL taken from two top-32 lists still misses each position's tail mass - document that.)
+void score_sequence(Model& M, const std::vector<int>& ids, int chunk, const std::string& out_path) {
+    const Config& c = M.c;
+    const int N = (int) ids.size();
+    if (N < 2) die("--score: needs at least two tokens (one position to score)");
+    FILE* f = stdout;
+    if (!out_path.empty()) {
+        f = std::fopen(out_path.c_str(), "w");
+        if (!f) die("--score: cannot write " + out_path);
+    }
+    std::printf("score: %d tokens, vocab %d, chunk %d, out %s\n", N, c.n_vocab, chunk,
+                out_path.empty() ? "(stdout)" : out_path.c_str());
+    std::vector<int> idx((size_t) c.n_vocab);
+    for (int i = 0; i < c.n_vocab; ++i) idx[(size_t) i] = i;
+    double nll = 0.0, t_exp = 0.0;
+    int npos = 0;
+    for (int p0 = 0; p0 < N; p0 += chunk) {
+        const int n = std::min(chunk, N - p0);
+        std::vector<float> lo;
+        forward(M, ids.data() + p0, n, p0, true, OutMode::kLogits, std::string(), lo, nullptr, t_exp);
+        if ((int) lo.size() != n * c.n_vocab) die("--score: the head returned the wrong logits shape");
+        for (int j = 0; j < n; ++j) {
+            const int pos = p0 + j;
+            if (pos + 1 >= N) break;   // (the last token of the sequence predicts nothing inside it)
+            const float* l = lo.data() + (size_t) j * c.n_vocab;
+            double mx = -1e30;
+            for (int v = 0; v < c.n_vocab; ++v) mx = std::max(mx, (double) l[v]);
+            double z = 0.0;
+            for (int v = 0; v < c.n_vocab; ++v) z += std::exp((double) l[v] - mx);
+            const int next = ids[(size_t) pos + 1];
+            const double lp = (double) l[next] - mx - std::log(z);
+            nll -= lp, ++npos;
+            std::partial_sort(idx.begin(), idx.begin() + 32, idx.end(), [&](int a, int b) { return l[a] > l[b]; });
+            std::fprintf(f, "score pos=%d next=%d lp=%.6f tops=", pos, next, lp);
+            for (int k = 0; k < 32; ++k) {
+                const int v = idx[(size_t) k];
+                std::fprintf(f, "%s%d:%.6f", k ? "," : "", v, std::exp((double) l[v] - mx) / z);
+            }
+            std::fputc('\n', f);
+            for (int i = 0; i < c.n_vocab; ++i) idx[(size_t) i] = i;   // (partial_sort reordered it)
+        }
+        std::fflush(f);
+    }
+    const double mn = npos ? nll / npos : 0.0;
+    std::fprintf(f, "score mean_nll=%.6f ppl=%.6f positions=%d tokens=%d\n", mn, std::exp(mn), npos, N);
+    if (f != stdout) std::fclose(f);
+    std::printf("score: %d positions, mean NLL %.6f, PPL %.4f\n", npos, mn, std::exp(mn));
+    std::fflush(stdout);
+}
+
 int main(int argc, char** argv) {
-    std::string model, toks, dump, draft_path, drafting;
+    std::string model, toks, dump, draft_path, drafting, score_toks;
     int gen = 16, chunk = 2048, ctx = 262144, threads = 8, n_gpu = 1;
+    bool gen_set = false;
     bool serve = false, serve_maya = true;   // (--serve: Maya's engine protocol; --serve-ik2: the @-line one)
     std::vector<int> eos_ids;                 // --eos a,b: the tokens a request ends at (Maya's protocol)
     double cache_gb = 60;
@@ -5353,12 +5545,44 @@ int main(int argc, char** argv) {
         else if (a == "--tokens") {   // (--tokens @FILE: the ids from a file - a long prompt passes a shell's limit)
             toks = next();
             if (!toks.empty() && toks[0] == '@') {
-                std::ifstream in(toks.substr(1));
-                toks.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+                // (the whole file, in chunks appended to the string: no fixed buffer and no line assumption, so a
+                //  100k-id prompt on one 550 KB line reads exactly as a 22-id one does.  A failed open is NAMED -
+                //  it used to read as "no tokens" and die on the usage line, which is the wrong message for a file
+                //  the user did pass.)
+                const std::string path = toks.substr(1);
+                std::ifstream in(path, std::ios::binary);
+                if (!in) die("cannot open the --tokens file " + path);
+                std::string all;
+                char buf[1 << 16];
+                while (in.read(buf, sizeof buf) || in.gcount() > 0) all.append(buf, (size_t) in.gcount());
+                if (!in.eof()) die("cannot read the --tokens file " + path);
+                toks.swap(all);
                 while (!toks.empty() && std::isspace((unsigned char) toks.back())) toks.pop_back();
+                if (toks.find_first_not_of(" \t\r\n") == std::string::npos)
+                    die("the --tokens file " + path + " holds no ids");
             }
         }
-        else if (a == "--gen") gen = std::atoi(next().c_str());
+        else if (a == "--gen") {
+            gen = std::atoi(next().c_str());
+            gen_set = true;
+            if (!score_toks.empty()) die("--score is teacher-forced scoring and --gen is generation: pass one");
+        }
+        else if (a == "--score") {   // (teacher-forced scoring of an ids sequence: --tokens' syntax, --gen's opposite)
+            score_toks = next();
+            if (!score_toks.empty() && score_toks[0] == '@') {
+                const std::string path = score_toks.substr(1);
+                std::ifstream in(path, std::ios::binary);
+                if (!in) die("cannot open the --score file " + path);
+                std::string all;
+                char buf[1 << 16];
+                while (in.read(buf, sizeof buf) || in.gcount() > 0) all.append(buf, (size_t) in.gcount());
+                if (!in.eof()) die("cannot read the --score file " + path);
+                score_toks.swap(all);
+                while (!score_toks.empty() && std::isspace((unsigned char) score_toks.back())) score_toks.pop_back();
+                if (score_toks.find_first_not_of(" \t\r\n") == std::string::npos)
+                    die("the --score file " + path + " holds no ids");
+            }
+        }
         else if (a == "--chunk") chunk = std::atoi(next().c_str());
         else if (a == "--ctx" || a == "--max-context") ctx = std::atoi(next().c_str());   // (--max-context: serve/server.py's name)
         else if (a == "--cache-gb") cache_gb = std::atof(next().c_str());
@@ -5408,14 +5632,23 @@ int main(int argc, char** argv) {
         g_trace = std::fopen(getenv("IK2_TRACE"), "wb");
         if (!g_trace) die(std::string("cannot write ") + getenv("IK2_TRACE"));
     }
-    if (model.empty() || (toks.empty() && !serve))
-        die("usage: maya-ik2 --model FIRST.gguf (--tokens 1,2,3 [--gen N] | --serve) [--chunk 2048] [--ctx N] ...");
+    if (model.empty() || (toks.empty() && !serve && score_toks.empty()))
+        die("usage: maya-ik2 --model FIRST.gguf (--tokens 1,2,3 [--gen N] | --score 1,2,3 | --serve) [--chunk 2048] "
+            "[--ctx N] ...");
+    if (gen_set && !score_toks.empty()) die("--score is teacher-forced scoring and --gen is generation: pass one");
     std::vector<int> prompt;
     for (const char* p = toks.c_str(); *p;) {
         prompt.push_back(std::atoi(p));
         while (*p && *p != ',') ++p;
         if (*p == ',') ++p;
     }
+    std::vector<int> score_ids;   // (--score: the sequence scored, teacher-forced; --tokens' parsing)
+    for (const char* p = score_toks.c_str(); *p;) {
+        score_ids.push_back(std::atoi(p));
+        while (*p && *p != ',') ++p;
+        if (*p == ',') ++p;
+    }
+    if (!score_ids.empty() && (int) score_ids.size() > ctx) die("--score: the sequence is past --ctx");
     check_preview(n_gpu, serve);
 #ifdef STRATA_USE_HIP
     {   // (AMD: the GEMMs' measured kernels - lt-picks.txt beside the GGUF, or IK2_LT_STORE's file; empty: none kept)
@@ -5602,6 +5835,36 @@ int main(int argc, char** argv) {
     g_dpack = getenv("IK2_DPACK") && std::atoi(getenv("IK2_DPACK")) != 0;
     g_dcbatch = getenv("IK2_DCBATCH") && std::atoi(getenv("IK2_DCBATCH")) != 0;
     g_ccache = getenv("IK2_CCACHE") && std::atoi(getenv("IK2_CCACHE")) != 0;
+    // (IK2_KV4: the 4-bit KV cache - storage, the write's pack, the decode's inline read (the split path) and the
+    //  prefill's unpack.  It implies fp8-class scale storage (a ue4m3 per 16 values inside each block).
+    //  IK2_KV4V: the same block on the V side only, K staying fp8 - the trial after both-4-bit's quality fail.)
+    g_kv4 = getenv("IK2_KV4") && std::atoi(getenv("IK2_KV4")) != 0;
+    g_kv4v = g_kv4 || (getenv("IK2_KV4V") && std::atoi(getenv("IK2_KV4V")) != 0);
+    if (g_kv4v) {
+        if (!g_kv_fp8) die("IK2_KV4 / IK2_KV4V need IK2_KV=fp8 (the 4-bit block is fp8-class: a ue4m3 a 16 values)");
+        // (the model's own heads, and the pack/read geometry at those heads - the geometry selftest ran at KVh=1 only,
+        //  and the engine reads with g = h/(H/Hkv): if this fails, the head grouping is the bug)
+        const int KDm = c.KV * c.D;
+        float wr = 0.0f;
+        const int rc = k::kv4_rows_selftest(c.KV, c.D, &wr);
+        std::printf("kv4: %s; H=%d KVh=%d D=%d, KD=%d, row4=%zu bytes; rows check at these heads: rc=%d worst rel %.3f\n",
+                    g_kv4 ? "K 4-bit / V 4-bit" : "K fp8 / V 4-bit", c.H, c.KV, c.D, KDm, k::kv4_row_bytes(KDm), rc, wr);
+        if (const char* sp = getenv("IK2_KV4STORE")) {   // (IK2_KV4STORE: the store's own report for one position)
+            k::set_kv4_store(std::atoi(sp));
+            std::printf("kv4: store report for position %d\n", std::atoi(sp));
+        }
+        if (const char* dp = getenv("IK2_KVDUMP")) {   // (the in-kernel row dump's position)
+            k::set_kv4_dump(std::atoi(dp));
+            std::printf("kv4: dumping the attention kernel's row for position %d\n", std::atoi(dp));
+        }
+        if (getenv("IK2_KV4MSE") && std::atoi(getenv("IK2_KV4MSE"))) {   // (the MSE-optimal scale in the pack)
+            k::set_kv4_mse(1);
+            std::printf("kv4: the pack's scale by least squared error\n");
+        }
+        if (g_kv4v && !g_kv4 && g_ccache)
+            die("IK2_KV4V: the conversation cache's KV windows assume one row size for K and V - run without IK2_CCACHE");
+        std::fflush(stdout);
+    }
     if (getenv("IK2_E4LUT") && std::atoi(getenv("IK2_E4LUT"))) {   // (task 2a: the scale LUT, filled from the decode)
         k::set_e4lut(1);
         std::printf("kernel tuning: NVFP4's scales read from the constant table (filled from the decode itself)\n");
@@ -6014,8 +6277,9 @@ int main(int argc, char** argv) {
         use_dev(Ly.dev);
         Vi.kv_cap = Ly.sliding ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : ctx;
         if (g_kv_fp8) {
-            Vi.kc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
-            Vi.vc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
+            // (IK2_KV4: the same buffers, a packed row of (KD/64)*36 bytes; KD % 64 is asserted where the pack enters)
+                Vi.kc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * (g_kv4 ? k::kv4_row_bytes(KD) : (size_t) KD * (g_kv_fp8 ? 1 : 2)));
+                Vi.vc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * (g_kv4v ? k::kv4_row_bytes(KD) : (size_t) KD * (g_kv_fp8 ? 1 : 2)));
         } else {
             Vi.kc = dalloc<uint16_t>((size_t) Vi.kv_cap * KD);
             Vi.vc = dalloc<uint16_t>((size_t) Vi.kv_cap * KD);
@@ -6070,8 +6334,13 @@ int main(int argc, char** argv) {
     if (g_stage) cudaFree(g_stage), g_stage = nullptr, g_stage_bytes = 0;
     {
         size_t kv_bytes = 0;
-        for (const auto& Vi : M.V) kv_bytes += (size_t) Vi.kv_cap * KD * (g_kv_fp8 ? 1 : 2) * 2;
-        std::printf("kv cache: %s (%.2f GiB across %d layer%s)\n", g_kv_fp8 ? "FP8 E4M3" : "FP16",
+        for (const auto& Vi : M.V)
+            kv_bytes += (size_t) Vi.kv_cap * ((g_kv4 ? k::kv4_row_bytes(KD) : (size_t) KD * (g_kv_fp8 ? 1 : 2)) +
+                          (g_kv4v ? k::kv4_row_bytes(KD) : (size_t) KD * (g_kv_fp8 ? 1 : 2)));
+        // (IK2_KV4: the honest figure - 4.5 bits a value, 56.2% of the fp8 cache's bytes; the tier's budget grows by the
+        //  difference, which the line after this one prints as free VRAM)
+        std::printf("kv cache: %s (%.2f GiB across %d layer%s)\n",
+                        g_kv4 ? "4-bit E2M1 x ue4m3" : (g_kv4v ? "K fp8 / V 4-bit E2M1 x ue4m3" : (g_kv_fp8 ? "FP8 E4M3" : "FP16")),
                     kv_bytes / 1073741824.0, c.n_visit, c.n_pass > 1 ? " visits" : "s");
         std::fflush(stdout);
     }
@@ -6398,6 +6667,10 @@ int main(int argc, char** argv) {
     if (g_kv_fp8) {
         W.kv_tmp_cap = std::min(ctx, 32768);
         W.kv_k16 = dalloc<uint16_t>((size_t) W.kv_tmp_cap * KD);
+        if (g_kv4v) {   // (IK2_KV4/KV4V: the write staging - a chunk's K (K4 only) and V rows in E4M3, before the pack)
+            W.kv_w8k = dalloc<uint8_t>((size_t) W.Tm * KD);
+            W.kv_w8v = dalloc<uint8_t>((size_t) W.Tm * KD);
+        }
         W.kv_v16 = dalloc<uint16_t>((size_t) W.kv_tmp_cap * KD);
     }
     W.pos = dalloc<int>(T_buf);
@@ -6864,7 +7137,8 @@ int main(int argc, char** argv) {
             std::vector<uint64_t> sig;
             std::vector<float> last;
         };
-        const size_t kv_elem_b = g_kv_fp8 ? 1 : 2;
+        // (IK2_KV4: a KV row's bytes, whatever the format - the snapshot's windows are whole rows, so only this changes)
+        const size_t kv_row_b = g_kv4 ? k::kv4_row_bytes(KD) : (size_t) KD * (g_kv_fp8 ? 1 : 2);
         std::vector<Snap> snaps(8);
         for (auto& sn : snaps) {
             sn.kv_k.resize(M.V.size());
@@ -6875,7 +7149,7 @@ int main(int argc, char** argv) {
                 const size_t cc[4] = {KD, KD, C, C};
                 for (int i = 0; i < 4; ++i) sn.h.push_back(dalloc<float>(3 * cc[i]));
                 if (Ly.sliding && Ly.kv_cap < ctx) {
-                    const size_t bytes = (size_t) c.window * KD * kv_elem_b;
+                    const size_t bytes = (size_t) c.window * kv_row_b;
                     sn.kv_k[l].resize(bytes);
                     sn.kv_v[l].resize(bytes);
                 }
@@ -6885,7 +7159,7 @@ int main(int argc, char** argv) {
         auto snap_copy = [&](Snap& sn, bool save) {
             const size_t cc[4] = {KD, KD, C, C};
             const cudaMemcpyKind kv_dir = save ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
-            const size_t row_b = (size_t) KD * kv_elem_b;
+            const size_t row_b = kv_row_b;
             for (size_t l = 0; l < M.V.size(); ++l) {   // (l: a visit)
                 Layer& Ly = bind_visit(M, (int) l);
                 use_dev(Ly.dev);
@@ -7239,7 +7513,7 @@ int main(int argc, char** argv) {
             if (L < ids.size()) {
                 const int T_sup = g_dev[0].W.T_sup;
                 const int sub_chunk = std::min(g_dev[0].W.Tm, 512);
-                if (T_sup > 0 && (n_gpu == 1 || dual()) && (int) (ids.size() - L) > 64) {
+                if (T_sup > 0 && (n_gpu == 1 || dual()) && (int) (ids.size() - L) > 64 && !g_kv4v) {
                     BigScratch bs;
                     const int T_pass = big_begin(M, g_dev[0].W, dev_cache(0), (int) (ids.size() - L), (int) ids.size(), bs);
                     for (size_t p0 = L; p0 < ids.size(); p0 += T_pass) {
@@ -7469,6 +7743,12 @@ int main(int argc, char** argv) {
         g_offs.lane.reset();   // (the CPU lane's thread polls mapped memory: stopped before the driver goes)
         return 0;
     }
+    if (!score_ids.empty()) {   // (--score: teacher forcing, no sampling, no generation - exits here)
+        score_sequence(M, score_ids, chunk,
+                       getenv("IK2_SCORE_OUT") ? std::string(getenv("IK2_SCORE_OUT")) : std::string());
+        g_offs.lane.reset();
+        return 0;
+    }
     if ((int) prompt.size() + gen > ctx) die("prompt + gen past --ctx");
     // the prompt
     std::vector<float> logits;
@@ -7479,7 +7759,7 @@ int main(int argc, char** argv) {
     g_lend.want = (int) prompt.size();   // (IK2_KVLEND: lend at the answer's first token)
     const int T_sup = g_dev[0].W.T_sup;
     const int sub_chunk = std::min(g_dev[0].W.Tm, 512);
-    if (T_sup > 0 && (n_gpu == 1 || dual()) && !drafter && !all && (int) prompt.size() > 64) {
+    if (T_sup > 0 && (n_gpu == 1 || dual()) && !drafter && !all && (int) prompt.size() > 64 && !g_kv4v) {   // (4-bit: the chunked path)
         BigScratch bs;
         const int T_pass = big_begin(M, g_dev[0].W, dev_cache(0), (int) prompt.size(), (int) prompt.size(), bs);
         if (T_pass != T_sup) std::printf("prefill passes of %d tokens (scratch lent by the expert cache)\n", T_pass);
@@ -7869,6 +8149,10 @@ int main(int argc, char** argv) {
     g_offs.lane.reset();
     return 0;
 }
+
+
+
+
 
 
 
