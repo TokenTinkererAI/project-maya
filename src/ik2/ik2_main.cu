@@ -5884,6 +5884,10 @@ int main(int argc, char** argv) {
         k::set_xglobal(1);
         std::printf("kernel tuning: the NVFP4 pair dot reads its input through global memory (no staging, no barrier)\n");
     }
+    if (getenv("IK2_HEADGEMV") && std::atoi(getenv("IK2_HEADGEMV"))) {   // (the LM head's GEMV: 32 rows a block)
+        k::set_headgemv(1);
+        std::printf("head GEMV: 32 rows a block (IK2_HEADGEMV)\n");
+    }
     if (g_ccache) std::printf("conversation cache: snapshots keep their token prefix and outlive a reset\n");
     if (ik2::watch::on())   // (IK2_WATCH: the two waits this path blocks in, named; a stall prints who was where)
         std::printf("watch: a wait past %.1f s reports, past %.1f s the engine stops by name\n", ik2::watch::threshold_s(),
@@ -8161,6 +8165,7 @@ int main(int argc, char** argv) {
     g_offs.lane.reset();
     return 0;
 }
+
 
 
 

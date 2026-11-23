@@ -541,6 +541,8 @@ void set_kv4_dump(int pos);
 void set_kv4_mse(int on);
 /// IK2_KV4STORE: one position's store report from inside prep_qkv_r_impl_kernel (its staging index and bytes).
 void set_kv4_store(int pos);
+/// IK2_HEADGEMV: the LM head's GEMV at 32 rows a block (a tiling choice; the logits are the same bytes).
+void set_headgemv(int on);
 /// IK2_KVAUDIT: the real-data error distribution of the 4-bit pack on `n` staging bytes (the fp8-form K/V a run wrote),
 /// both scales side by side - the numbers the synthetic selftests cannot give.
 void kv4_stage_audit(const uint8_t* d8, int n);
@@ -568,6 +570,7 @@ void kv4_pack_rows(const uint8_t* src8, uint8_t* dst4, int T, int KVh, int D, in
 void unpack_kv4_to_f16(const uint8_t* kc4, const uint8_t* vc4, int kv_cap, int k0, int nk, int KD, int row4,
                        float k_inv, float v_inv, uint16_t* k16, uint16_t* v16, cudaStream_t s, int kv4k = 1);
 }  // namespace ik2::k
+
 
 
 

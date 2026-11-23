@@ -7479,6 +7479,15 @@ void attn_multi_fp8(const float* q, const float* r, const float* sink, const uin
                     window, scratch, out, s);
 }
 
+// (IK2_HEADGEMV: the LM head's GEMV - a vocabulary of ~200k rows - takes 32 rows a block instead of 16: half the
+//  blocks and half the input stages for the same rows.  A tiling choice only: a row's dot, its lanes and their order
+//  are untouched, so the logits are the same bytes.)
+__constant__ int g_headgemv = 0;
+void set_headgemv(int on) {
+    cudaMemcpyToSymbol(g_headgemv, &on, sizeof on);
+    check("set_headgemv");
+}
+
 template <int WARPS, int ROWS>
 void launch_mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s) {
     mv_blocks_kernel<WARPS, ROWS><<<(unsigned) ((N + WARPS * ROWS - 1) / (WARPS * ROWS)), WARPS * 32,
@@ -7501,6 +7510,7 @@ void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* 
     else if (N <= 512) launch_mv_blocks<2, 1>(type, W, N, K, x, y, s);
     else if (N <= 2048) launch_mv_blocks<4, 1>(type, W, N, K, x, y, s);
     else if (N <= 16384) launch_mv_blocks<4, 2>(type, W, N, K, x, y, s);
+    else if (g_headgemv) launch_mv_blocks<8, 4>(type, W, N, K, x, y, s);   // (IK2_HEADGEMV: the head's 200k rows)
     else launch_mv_blocks<8, 2>(type, W, N, K, x, y, s);
     check("mv_blocks");
 }
@@ -7990,6 +8000,7 @@ void experts_down_mem(const uint8_t* const* blob, const int* n, const int* row, 
 bool experts_block_exact() { return experts_mma_split(true) == 8 && experts_mma_split(false) == 4; }
 
 }  // namespace ik2::k
+
 
 
 
