@@ -2315,7 +2315,9 @@ __global__ void tail_mark_kernel(const int* top, const uint8_t* rank, int S, int
 }
 // one thread a token: the kept picks (rank < tail_n or an expert the batch needs) rescaled to sum to `scale`; a
 // left-out slot takes the lowest kept expert in the tier at weight 0 (the lowest kept one if the tier holds none of
-// them), so nothing is fetched for it
+// them), so nothing is fetched for it.  `need == nullptr` is the decode's T = 1 fast path: there the batch's need
+// set is the tier's table and nothing else (a second pick of the same expert cannot exist within one token's K),
+// so the seed and the mark are skipped and this one kernel is the whole pass.
 __global__ void tail_apply_kernel(int* top, float* w, const uint8_t* rank, const int* need, const uint8_t* resid, int K,
                                   int tail_n, float scale) {
     const int t = blockIdx.x;
@@ -2326,7 +2328,7 @@ __global__ void tail_apply_kernel(int* top, float* w, const uint8_t* rank, const
     bool keep[kRouteMax];
     int nkeep = 0;
     for (int k = 0; k < K; ++k) {
-        keep[k] = rk[k] < tail_n || need[tp[k]] != 0;
+        keep[k] = rk[k] < tail_n || (need ? need[tp[k]] : resid[tp[k]]) != 0;
         nkeep += keep[k] ? 1 : 0;
     }
     if (nkeep == K) return;   // (nothing left out: the router's own weights, to the bit)
@@ -6840,6 +6842,11 @@ void tail_pass(int T, int E, int K, float scale, int* top, float* w, const uint8
     uint8_t* rank = nullptr;
     const int S = T * K;
     tail_scratch(E, (size_t) S, &need, &rank, s);
+    if (T == 1) {   // (decode: need == the tier's table, so the seed and the mark would be pure cost - see the apply)
+        tail_apply_kernel<<<1, 32, 0, s>>>(top, w, rank, nullptr, resid, K, tail_n, scale);
+        check("tail_apply");
+        return;
+    }
     tail_seed_kernel<<<(unsigned) std::min((E + 255) / 256, 64), 256, 0, s>>>(need, resid, E);
     check("tail_seed");
     tail_mark_kernel<<<(unsigned) std::min((S + 255) / 256, 1024), 256, 0, s>>>(top, rank, S, tail_n, need);
