@@ -306,11 +306,14 @@ bool g_stale = false;        // IK2_STALE: eviction first takes an expert whose 
 bool g_vweight = false;      // IK2_VWEIGHT: the tier's pool shares by the visits a layer gets a token
 bool g_cpu_meas = false;     // IK2_CPU_MEAS: the CALIB lane costs pick the visit's CPU share (the mm3 argmin)
 bool g_fuse = false;         // IK2_FUSE: the host token path's combine + short conv as the resident path's one launch
-// (IK2_CACHE_BIAS=F, 0: off - the router's score of an expert the VRAM tier holds gets F, before the top-K pick, so a
-//  token spends its misses on the experts it keeps anyway: the tier's own set is what the arithmetic prefers.  The
-//  bias goes into the router's own per-expert bias table (Ly.probs_b), rebuilt when the tier moves - the four routing
-//  kernels take the table, so decode and prefill both see it, and with F at 0 the table is the model's, untouched.)
-float g_cache_bias = 0.0f;
+// (IK2_CACHE_BIAS=F, default 0.15, 0: off - the router's score of an expert the VRAM tier holds gets F, before the
+//  top-K pick, so a token spends its misses on the experts it keeps anyway: the tier's own set is what the arithmetic
+//  prefers.  The bias goes into the router's own per-expert bias table (Ly.probs_b), rebuilt when the tier moves - the
+//  four routing kernels take the table, so decode and prefill both see it, and with F at 0 the table is the model's,
+//  untouched.  Maya's default since 2026-11-24, measured on this box at 131K: 28.97 -> 31.86 tok/s (+10 pct), misses
+//  21,520 -> 11,037 a run, for +0.033 mean NLL and top-1 token identical on all 511 scored positions (and 2,047/2,047
+//  at 2K); 0.20 was faster (+11 pct) for +0.101 NLL.  IK2_CACHE_BIAS=0 restores the model's table exactly.)
+float g_cache_bias = 0.15f;
 // (IK2_TAIL_SKIP=N, 0: off - after the top-K pick, a pick of rank N or past it (0-based: N=4 -> ranks 5..8) whose
 //  expert the tier does not hold is left out and not fetched; the kept picks are rescaled to sum to the scale the
 //  full K summed to, so the combine stays scale-correct.  The slot keeps a resident pick's expert at weight 0 - the
@@ -5912,14 +5915,21 @@ int main(int argc, char** argv) {
     if (getenv("IK2_UP_MS")) g_t_up = std::atof(getenv("IK2_UP_MS")) * 1e-3;
     g_sync_kill = getenv("IK2_SYNC_KILL") && std::atoi(getenv("IK2_SYNC_KILL")) != 0;
     g_stale = getenv("IK2_STALE") && std::atoi(getenv("IK2_STALE")) != 0;
-    // (IK2_CACHE_BIAS: a router-score bias to the experts the VRAM tier holds; IK2_TAIL_SKIP: the deep picks the tier
-    //  does not hold left out.  Both default off, and a run with neither is the engine as it was.)
-    g_cache_bias = getenv("IK2_CACHE_BIAS") ? (float) std::atof(getenv("IK2_CACHE_BIAS")) : 0.0f;
+    // (IK2_CACHE_BIAS: a router-score bias to the experts the VRAM tier holds, 0.15 by default since 2026-11-24 -
+    //  IK2_CACHE_BIAS=0 turns it off and leaves the model's table untouched; IK2_TAIL_SKIP: the deep picks the tier
+    //  does not hold left out, off by default - it costs more quality per point of speed than the bias does.)
+    const bool bias_named = getenv("IK2_CACHE_BIAS") != nullptr;
+    g_cache_bias = bias_named ? (float) std::atof(getenv("IK2_CACHE_BIAS")) : 0.15f;
     g_tail_skip = getenv("IK2_TAIL_SKIP") ? std::atoi(getenv("IK2_TAIL_SKIP")) : 0;
     if (g_tail_skip < 0 || g_tail_skip > 7) die("IK2_TAIL_SKIP: 0 .. 7 (0: off; N: the picks of rank N + 1 .. K left "
                                                 "out when the tier does not hold them)");
-    if ((g_cache_bias != 0.0f || g_tail_skip > 0) && n_gpu > 1)
-        die("IK2_CACHE_BIAS / IK2_TAIL_SKIP: one GPU's tier only (the model's layers are shared between GPUs)");
+    if ((g_cache_bias != 0.0f || g_tail_skip > 0) && n_gpu > 1) {
+        // (the built-in default is a one-GPU tier's lever: a named bias on a multi-GPU run is the caller's error, a
+        //  default one is simply not applied - the model's layers are shared between GPUs)
+        if (bias_named) die("IK2_CACHE_BIAS / IK2_TAIL_SKIP: one GPU's tier only (the model's layers are shared "
+                            "between GPUs)");
+        g_cache_bias = 0.0f;
+    }
     g_vweight = getenv("IK2_VWEIGHT") && std::atoi(getenv("IK2_VWEIGHT")) != 0;
     g_cpu_meas = getenv("IK2_CPU_MEAS") && std::atoi(getenv("IK2_CPU_MEAS")) != 0;
     g_fuse = getenv("IK2_FUSE") && std::atoi(getenv("IK2_FUSE")) != 0;
@@ -7220,7 +7230,7 @@ int main(int argc, char** argv) {
         }
     }
     if (g_cache_bias != 0.0f)
-        std::printf("cache bias: %g to the experts in VRAM\n", (double) g_cache_bias);
+        std::printf("cache bias: %g to the experts in VRAM (IK2_CACHE_BIAS=0 turns it off)\n", (double) g_cache_bias);
     if (g_tail_skip > 0)
         std::printf("tail skip: ranks %d..%d left out when not in VRAM\n", g_tail_skip + 1, M.c.K);
     std::fflush(stdout);
