@@ -216,6 +216,8 @@ struct Layer {
     uint16_t *sink16 = nullptr;                    // F16 [H][C] (used in g_dense_q8; fused in !g_dense_q8)
     uint16_t *router16 = nullptr;                  // F16 [E][C]
     float *probs_b;                                // F32 [E]
+    // (IK2_CACHE_BIAS: the model's own router bias on the host, and the table the knob rewrites)
+    std::vector<float> probs_h, probs_k;
     float *attn_norm, *q_in_norm, *k_in_norm, *v_in_norm, *ffn_norm;
     float *q_clip, *r_clip, *rel_proj;             // [H][D], [H][d_rel], [extent][d_rel]
     float *res_score, *ffn_res_score;              // [nq][C], [C]
@@ -301,6 +303,11 @@ bool g_stale = false;        // IK2_STALE: eviction first takes an expert whose 
 bool g_vweight = false;      // IK2_VWEIGHT: the tier's pool shares by the visits a layer gets a token
 bool g_cpu_meas = false;     // IK2_CPU_MEAS: the CALIB lane costs pick the visit's CPU share (the mm3 argmin)
 bool g_fuse = false;         // IK2_FUSE: the host token path's combine + short conv as the resident path's one launch
+// (IK2_CACHE_BIAS=F, 0: off - the router's score of an expert the VRAM tier holds gets F, before the top-K pick, so a
+//  token spends its misses on the experts it keeps anyway: the tier's own set is what the arithmetic prefers.  The
+//  bias goes into the router's own per-expert bias table (Ly.probs_b), rebuilt when the tier moves - the four routing
+//  kernels take the table, so decode and prefill both see it, and with F at 0 the table is the model's, untouched.)
+float g_cache_bias = 0.0f;
 // (IK2_DROUTE: the device-routing project's first tranche.  The lane's input copy - W.xq, final after the MoE-input
 //  norm - is issued then, on a stream of its own, so it runs beside the router's GEMM and the route kernel instead of
 //  after the routing D2H on g_s; the host polls for it once, right after the routing wait, and gets it long since.
@@ -1307,6 +1314,23 @@ struct ExpertCache {
         for (int i = 0; i < n; ++i) copy_in(Ly, es[i], dst[i], st);
     }
 };
+
+// IK2_CACHE_BIAS: the router bias with F added to the experts the VRAM tier holds.  Built from the cache's own loc[] -
+// the table the banner's "N of M experts in VRAM" counts and get() moves, so it is the residency the fetch path acts
+// on, not a second guess - and remade only when a slot moved (a token's visit can evict, so it is checked at each
+// routing, not once).  With F at 0 nothing is touched: probs_b stays the model's.
+void route_tables(Layer& Ly, ExpertCache& EC, int l) {
+    if (g_cache_bias == 0.0f) return;
+    const int E = EC.E;
+    bool moved = false;
+    for (int e = 0; e < E; ++e) {
+        const float b = Ly.probs_h[(size_t) e] + (EC.loc[(size_t) l * E + e] >= 0 ? g_cache_bias : 0.0f);
+        moved = moved || b != Ly.probs_k[(size_t) e];
+        Ly.probs_k[(size_t) e] = b;
+    }
+    if (!moved) return;
+    CU(cudaMemcpyAsync(Ly.probs_b, Ly.probs_k.data(), (size_t) E * 4, cudaMemcpyHostToDevice, g_s));
+}
 
 // ---- the forward
 
@@ -2848,6 +2872,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             }
         }
         k::mv_f16(Ly.router16, c.E, C, W.xq, W.rlog, g_s);
+        route_tables(Ly, dev_cache(0), l);   // (IK2_CACHE_BIAS: the tier's set in the router's bias, this visit's)
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + c.K);
         // (NVFP4 experts go through the tensor cores, their input as two FP16 limbs the router's launch writes)
@@ -3780,6 +3805,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         k::mv_f16_rows(Ly.router16, c.E, C, W.xq, C, T, W.rlog, c.E, g_s);
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
+        route_tables(Ly, dev_cache(0), l);
         k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
         k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], g_blk.blob, g_blk.n,
                        g_blk.tok, g_blk.row, g_blk.sg, g_blk.su, g_blk.wt, g_blk.inv, g_s);
@@ -4309,6 +4335,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         const int S = T * c.K;
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
+        route_tables(Ly, EC, l);
         k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
         CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
         // (IK2_SYNC_KILL: the routing's D2H is a few dozen bytes, so the host waits on a 4-byte flag the same stream
@@ -5151,6 +5178,7 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
         const int S = T * c.K;
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
+        route_tables(Ly, EC, l);
         k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
         CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
         CU(cudaStreamSynchronize(g_s));
@@ -5831,6 +5859,11 @@ int main(int argc, char** argv) {
     if (getenv("IK2_UP_MS")) g_t_up = std::atof(getenv("IK2_UP_MS")) * 1e-3;
     g_sync_kill = getenv("IK2_SYNC_KILL") && std::atoi(getenv("IK2_SYNC_KILL")) != 0;
     g_stale = getenv("IK2_STALE") && std::atoi(getenv("IK2_STALE")) != 0;
+    // (IK2_CACHE_BIAS: a router-score bias to the experts the VRAM tier holds.  Default off, and a run with it unset is
+    //  the engine as it was.)
+    g_cache_bias = getenv("IK2_CACHE_BIAS") ? (float) std::atof(getenv("IK2_CACHE_BIAS")) : 0.0f;
+    if (g_cache_bias != 0.0f && n_gpu > 1)
+        die("IK2_CACHE_BIAS: one GPU's tier only (the model's layers are shared between GPUs)");
     g_vweight = getenv("IK2_VWEIGHT") && std::atoi(getenv("IK2_VWEIGHT")) != 0;
     g_cpu_meas = getenv("IK2_CPU_MEAS") && std::atoi(getenv("IK2_CPU_MEAS")) != 0;
     g_fuse = getenv("IK2_FUSE") && std::atoi(getenv("IK2_FUSE")) != 0;
@@ -6191,7 +6224,10 @@ int main(int argc, char** argv) {
         }
         Ly.wo = load_mat(S, b + "attn_output.weight", (int) C, (int) HD);
         Ly.router16 = load_f16(S, b + "ffn_gate_inp.weight", (size_t) c.E * C);
-        Ly.probs_b = load_f32(S, b + "exp_probs_b.bias", c.E);
+        // (IK2_CACHE_BIAS: the model's own bias is kept on the host - the knob rebuilds the device table from it)
+        Ly.probs_h = host_f32(S, b + "exp_probs_b.bias", c.E);
+        Ly.probs_b = dev_f32(Ly.probs_h);
+        if (g_cache_bias != 0.0f) Ly.probs_k.assign(Ly.probs_h.begin(), Ly.probs_h.end());
         Ly.ffn_norm = load_f32(S, b + "ffn_norm.weight", C);
         if (Ly.sliding) {
             Ly.attn_norm = load_f32(S, b + "attn_norm.weight", C);
@@ -7121,6 +7157,8 @@ int main(int argc, char** argv) {
             std::printf("resident path off: %s\n", all ? "a dense matrix is not kept as blocks" : "the cache does not hold every expert");
         }
     }
+    if (g_cache_bias != 0.0f)
+        std::printf("cache bias: %g to the experts in VRAM\n", (double) g_cache_bias);
     std::fflush(stdout);
     }
     // the caches' counters, summed over the GPUs
