@@ -216,8 +216,11 @@ struct Layer {
     uint16_t *sink16 = nullptr;                    // F16 [H][C] (used in g_dense_q8; fused in !g_dense_q8)
     uint16_t *router16 = nullptr;                  // F16 [E][C]
     float *probs_b;                                // F32 [E]
-    // (IK2_CACHE_BIAS: the model's own router bias on the host, and the table the knob rewrites)
+    // (IK2_CACHE_BIAS / IK2_TAIL_SKIP: the model's own router bias on the host, the table the knob rewrites, and
+    //  the tier's residency [E] (1: the expert in VRAM) with the host copy the device one was made from)
     std::vector<float> probs_h, probs_k;
+    uint8_t* resid_d = nullptr;
+    std::vector<uint8_t> resid_h;
     float *attn_norm, *q_in_norm, *k_in_norm, *v_in_norm, *ffn_norm;
     float *q_clip, *r_clip, *rel_proj;             // [H][D], [H][d_rel], [extent][d_rel]
     float *res_score, *ffn_res_score;              // [nq][C], [C]
@@ -308,6 +311,11 @@ bool g_fuse = false;         // IK2_FUSE: the host token path's combine + short 
 //  bias goes into the router's own per-expert bias table (Ly.probs_b), rebuilt when the tier moves - the four routing
 //  kernels take the table, so decode and prefill both see it, and with F at 0 the table is the model's, untouched.)
 float g_cache_bias = 0.0f;
+// (IK2_TAIL_SKIP=N, 0: off - after the top-K pick, a pick of rank N or past it (0-based: N=4 -> ranks 5..8) whose
+//  expert the tier does not hold is left out and not fetched; the kept picks are rescaled to sum to the scale the
+//  full K summed to, so the combine stays scale-correct.  The slot keeps a resident pick's expert at weight 0 - the
+//  shapes the expert kernels and the combine take do not change, and nothing is copied for it.)
+int g_tail_skip = 0;
 // (IK2_DROUTE: the device-routing project's first tranche.  The lane's input copy - W.xq, final after the MoE-input
 //  norm - is issued then, on a stream of its own, so it runs beside the router's GEMM and the route kernel instead of
 //  after the routing D2H on g_s; the host polls for it once, right after the routing wait, and gets it long since.
@@ -1315,21 +1323,56 @@ struct ExpertCache {
     }
 };
 
-// IK2_CACHE_BIAS: the router bias with F added to the experts the VRAM tier holds.  Built from the cache's own loc[] -
-// the table the banner's "N of M experts in VRAM" counts and get() moves, so it is the residency the fetch path acts
-// on, not a second guess - and remade only when a slot moved (a token's visit can evict, so it is checked at each
-// routing, not once).  With F at 0 nothing is touched: probs_b stays the model's.
+// IK2_CACHE_BIAS / IK2_TAIL_SKIP: the layer's tier table on the device (1: the expert in VRAM) and, when the bias is
+// set, the router bias with F added to the residents.  Built from the cache's own loc[] - the table the banner's
+// "N of M experts in VRAM" counts and get() moves, so it is the residency the fetch path acts on, not a second guess -
+// and remade only when a slot moved (a token's visit can evict, so it is checked at each routing, not once).
+// A knob that is off touches nothing: probs_b stays the model's, and resid_d is null for the kernels.
 void route_tables(Layer& Ly, ExpertCache& EC, int l) {
-    if (g_cache_bias == 0.0f) return;
+    if (!g_cache_bias && !g_tail_skip) return;
     const int E = EC.E;
     bool moved = false;
     for (int e = 0; e < E; ++e) {
-        const float b = Ly.probs_h[(size_t) e] + (EC.loc[(size_t) l * E + e] >= 0 ? g_cache_bias : 0.0f);
-        moved = moved || b != Ly.probs_k[(size_t) e];
-        Ly.probs_k[(size_t) e] = b;
+        const uint8_t r = (uint8_t) (EC.loc[(size_t) l * E + e] >= 0);
+        moved = moved || r != Ly.resid_h[(size_t) e];
+        Ly.resid_h[(size_t) e] = r;
     }
     if (!moved) return;
-    CU(cudaMemcpyAsync(Ly.probs_b, Ly.probs_k.data(), (size_t) E * 4, cudaMemcpyHostToDevice, g_s));
+    CU(cudaMemcpyAsync(Ly.resid_d, Ly.resid_h.data(), (size_t) E, cudaMemcpyHostToDevice, g_s));
+    if (g_cache_bias != 0.0f) {
+        for (int e = 0; e < E; ++e)
+            Ly.probs_k[(size_t) e] = Ly.probs_h[(size_t) e] + (Ly.resid_h[(size_t) e] ? g_cache_bias : 0.0f);
+        CU(cudaMemcpyAsync(Ly.probs_b, Ly.probs_k.data(), (size_t) E * 4, cudaMemcpyHostToDevice, g_s));
+    }
+}
+
+// (IK2_CACHE_BIAS_STATS: the score scale the bias has to be read against - the run's mean and spread of the router's
+//  scores and the top-8 cut's gap, summed on the device and printed at the end.  Off unless asked, as the extra
+//  launch a layer would otherwise pay for a measurement.)
+bool g_rs_on = false;
+double* g_rs_acc = nullptr;
+int g_rs_E = 0;
+void route_measure(const float* logits, const float* bias, int T, int E) {
+    if (!g_rs_on) return;
+    g_rs_E = E;
+    if (!g_rs_acc) {
+        g_rs_acc = dalloc<double>(5);
+        CU(cudaMemsetAsync(g_rs_acc, 0, 5 * sizeof(double), g_s));
+    }
+    k::route_stats(logits, bias, T, E, g_rs_acc, g_s);
+}
+// (IK2_CACHE_BIAS_STATS: the report - the run's score scale and the top-8 cut - at the run's end or a --score's)
+void route_measure_report() {
+    if (!g_rs_acc) return;
+    double h[5] = {0, 0, 0, 0, 0};
+    CU(cudaMemcpy(h, g_rs_acc, sizeof h, cudaMemcpyDeviceToHost));
+    if (h[2] <= 0) return;
+    const double E = (double) g_rs_E;   // (a token's sum over its experts: per-expert units here)
+    const double n = h[2] * E, mu = h[0] / n, m2 = h[1] / n;
+    const double sd = std::sqrt(std::max(0.0, m2 - mu * mu));
+    std::printf("router scores: mean %.5f, std %.5f over %d experts a token (n %d); 8th-best score %.5f, top-8 cut "
+                "gap (8th - 9th) %.5f\n", mu, sd, (int) E, (int) h[2], h[4] / h[2], h[3] / h[2]);
+    std::fflush(stdout);
 }
 
 // ---- the forward
@@ -2872,9 +2915,9 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             }
         }
         k::mv_f16(Ly.router16, c.E, C, W.xq, W.rlog, g_s);
-        route_tables(Ly, dev_cache(0), l);   // (IK2_CACHE_BIAS: the tier's set in the router's bias, this visit's)
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + c.K);
+        route_tables(Ly, dev_cache(0), l);   // (IK2_CACHE_BIAS / IK2_TAIL_SKIP: the tier's table for this router)
         // (NVFP4 experts go through the tensor cores, their input as two FP16 limbs the router's launch writes)
 #ifdef STRATA_USE_HIP   // (AMD: the scalar kernels read the blocks faster than the mma's layouts on the shuffles)
         static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 0;
@@ -2884,7 +2927,8 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         const bool exp_tc = exp_mma && !g_lane && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
-                       exp_tc ? (uint16_t*) W.gu32 : nullptr);
+                       exp_tc ? (uint16_t*) W.gu32 : nullptr, Ly.resid_d, g_tail_skip);
+        route_measure(W.rlog, Ly.probs_b, 1, c.E);
         if (g_off) {   // (the offload path: the picks the tier does not hold copied into staging, their slots filled)
             const auto& st = g_offs.stage[g_offs.pool[l]];
             if (g_lane) {   // (lane parity: every expert in ik2_exact.h's sums, the CPU lane beside the fetch)
@@ -3806,7 +3850,8 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         route_tables(Ly, dev_cache(0), l);
-        k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
+        k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s, Ly.resid_d, g_tail_skip);
+        route_measure(W.rlog, Ly.probs_b, T, c.E);
         k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], g_blk.blob, g_blk.n,
                        g_blk.tok, g_blk.row, g_blk.sg, g_blk.su, g_blk.wt, g_blk.inv, g_s);
         // (exact: the token path's choice - NVFP4 on the tensor cores unless IK2_EXPERT_MMA=0, else the row dots)
@@ -4336,7 +4381,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         route_tables(Ly, EC, l);
-        k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
+        k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s, Ly.resid_d, g_tail_skip);
+        route_measure(W.rlog, Ly.probs_b, T, c.E);
         CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
         // (IK2_SYNC_KILL: the routing's D2H is a few dozen bytes, so the host waits on a 4-byte flag the same stream
         //  writes rather than blocking in the driver - cudaStreamSynchronize's path costs tens of microseconds a
@@ -5179,7 +5225,8 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         route_tables(Ly, EC, l);
-        k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
+        k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s, Ly.resid_d, g_tail_skip);
+        route_measure(W.rlog, Ly.probs_b, T, c.E);
         CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
         CU(cudaStreamSynchronize(g_s));
         const int* top_h = W.route_h;
@@ -5553,6 +5600,12 @@ void score_sequence(Model& M, const std::vector<int>& ids, int chunk, const std:
     std::fprintf(f, "score mean_nll=%.6f ppl=%.6f positions=%d tokens=%d\n", mn, std::exp(mn), npos, N);
     if (f != stdout) std::fclose(f);
     std::printf("score: %d positions, mean NLL %.6f, PPL %.4f\n", npos, mn, std::exp(mn));
+    if (g_cache_bias != 0.0f || g_tail_skip > 0 || g_rs_on) {   // (the knobs' physical effect: the prefill's cache)
+        unsigned long long hh = 0, mm = 0;
+        double bb = 0;
+        for (auto& D : g_dev) hh += D.EC.hits, mm += D.EC.misses, bb += (double) D.EC.bytes_up;
+        std::printf("score cache: %llu hits, %llu misses, %.2f GiB copied\n", hh, mm, bb / 1073741824.0);
+    }
     std::fflush(stdout);
 }
 
@@ -5859,17 +5912,21 @@ int main(int argc, char** argv) {
     if (getenv("IK2_UP_MS")) g_t_up = std::atof(getenv("IK2_UP_MS")) * 1e-3;
     g_sync_kill = getenv("IK2_SYNC_KILL") && std::atoi(getenv("IK2_SYNC_KILL")) != 0;
     g_stale = getenv("IK2_STALE") && std::atoi(getenv("IK2_STALE")) != 0;
-    // (IK2_CACHE_BIAS: a router-score bias to the experts the VRAM tier holds.  Default off, and a run with it unset is
-    //  the engine as it was.)
+    // (IK2_CACHE_BIAS: a router-score bias to the experts the VRAM tier holds; IK2_TAIL_SKIP: the deep picks the tier
+    //  does not hold left out.  Both default off, and a run with neither is the engine as it was.)
     g_cache_bias = getenv("IK2_CACHE_BIAS") ? (float) std::atof(getenv("IK2_CACHE_BIAS")) : 0.0f;
-    if (g_cache_bias != 0.0f && n_gpu > 1)
-        die("IK2_CACHE_BIAS: one GPU's tier only (the model's layers are shared between GPUs)");
+    g_tail_skip = getenv("IK2_TAIL_SKIP") ? std::atoi(getenv("IK2_TAIL_SKIP")) : 0;
+    if (g_tail_skip < 0 || g_tail_skip > 7) die("IK2_TAIL_SKIP: 0 .. 7 (0: off; N: the picks of rank N + 1 .. K left "
+                                                "out when the tier does not hold them)");
+    if ((g_cache_bias != 0.0f || g_tail_skip > 0) && n_gpu > 1)
+        die("IK2_CACHE_BIAS / IK2_TAIL_SKIP: one GPU's tier only (the model's layers are shared between GPUs)");
     g_vweight = getenv("IK2_VWEIGHT") && std::atoi(getenv("IK2_VWEIGHT")) != 0;
     g_cpu_meas = getenv("IK2_CPU_MEAS") && std::atoi(getenv("IK2_CPU_MEAS")) != 0;
     g_fuse = getenv("IK2_FUSE") && std::atoi(getenv("IK2_FUSE")) != 0;
     g_droute = getenv("IK2_DROUTE") && std::atoi(getenv("IK2_DROUTE")) != 0;
     g_dpack = getenv("IK2_DPACK") && std::atoi(getenv("IK2_DPACK")) != 0;
     g_dcbatch = getenv("IK2_DCBATCH") && std::atoi(getenv("IK2_DCBATCH")) != 0;
+    g_rs_on = getenv("IK2_CACHE_BIAS_STATS") && std::atoi(getenv("IK2_CACHE_BIAS_STATS")) != 0;
     // (proven default from the 2026-11 campaign: ON)
     g_ccache = !getenv("IK2_CCACHE") || std::atoi(getenv("IK2_CCACHE")) != 0;
     // (IK2_KV4: the 4-bit KV cache - storage, the write's pack, the decode's inline read (the split path) and the
@@ -6227,7 +6284,12 @@ int main(int argc, char** argv) {
         // (IK2_CACHE_BIAS: the model's own bias is kept on the host - the knob rebuilds the device table from it)
         Ly.probs_h = host_f32(S, b + "exp_probs_b.bias", c.E);
         Ly.probs_b = dev_f32(Ly.probs_h);
-        if (g_cache_bias != 0.0f) Ly.probs_k.assign(Ly.probs_h.begin(), Ly.probs_h.end());
+        if (g_cache_bias != 0.0f || g_tail_skip > 0) {
+            Ly.probs_k.assign(Ly.probs_h.begin(), Ly.probs_h.end());
+            Ly.resid_h.assign((size_t) c.E, 0);
+            Ly.resid_d = dalloc<uint8_t>((size_t) c.E);
+            CU(cudaMemset(Ly.resid_d, 0, (size_t) c.E));   // (the table route_tables' first "no move" assumes)
+        }
         Ly.ffn_norm = load_f32(S, b + "ffn_norm.weight", C);
         if (Ly.sliding) {
             Ly.attn_norm = load_f32(S, b + "attn_norm.weight", C);
@@ -7159,6 +7221,8 @@ int main(int argc, char** argv) {
     }
     if (g_cache_bias != 0.0f)
         std::printf("cache bias: %g to the experts in VRAM\n", (double) g_cache_bias);
+    if (g_tail_skip > 0)
+        std::printf("tail skip: ranks %d..%d left out when not in VRAM\n", g_tail_skip + 1, M.c.K);
     std::fflush(stdout);
     }
     // the caches' counters, summed over the GPUs
@@ -7800,6 +7864,7 @@ int main(int argc, char** argv) {
     if (!score_ids.empty()) {   // (--score: teacher forcing, no sampling, no generation - exits here)
         score_sequence(M, score_ids, chunk,
                        getenv("IK2_SCORE_OUT") ? std::string(getenv("IK2_SCORE_OUT")) : std::string());
+        route_measure_report();
         g_offs.lane.reset();
         return 0;
     }
@@ -8194,6 +8259,9 @@ int main(int argc, char** argv) {
         std::printf("generation: %d tokens in %.2f s (%.2f tok/s); cache %llu hits, %llu misses in it\n",
                     (int) out.size() - 1, gen_s, (out.size() - 1) / gen_s, (unsigned long long) (ec_sum([](ExpertCache& e) { return e.hits; }) - h0),
                     (unsigned long long) (ec_sum([](ExpertCache& e) { return e.misses; }) - m0));
+    if (g_rs_acc) {   // (IK2_CACHE_BIAS_STATS: the scores the bias is read against)
+        route_measure_report();
+    }
     std::printf("generated:");
     for (int t : out) std::printf(" %d", t);
     std::printf("\n");

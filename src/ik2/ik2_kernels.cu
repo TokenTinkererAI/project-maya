@@ -2187,9 +2187,32 @@ __global__ void gate_mul_impl_kernel(float* o, const float* g, size_t n, uint16_
 }
 
 constexpr int kRouteMax = 16;
+// (IK2_TAIL_SKIP: ch[0..K) in rank order - the first `tail_n` ranks are kept, past them only an expert the tier holds;
+//  a left-out pick's slot takes the first kept resident expert (so nothing is fetched for it) at weight 0, and the kept
+//  picks' weights are rescaled to sum to `scale` - the total the full K summed to.  Returns the kept experts' sigmoid
+//  sum in *sum (rank order).  Call with tail_n > 0 and resid non-null only.)
+__device__ __forceinline__ float tail_skip_picks(int* ch, const float* sc, int K, const uint8_t* resid, int tail_n,
+                                                 bool* keep, float* sum) {
+    float s = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        keep[k] = k < tail_n || resid[ch[k]] != 0;
+        if (keep[k]) s += sc[k];
+    }
+    int low = -1, any = -1;   // (the slot's placeholder: the lowest kept expert in VRAM, else the lowest kept)
+    for (int k = 0; k < K; ++k) {
+        if (!keep[k]) continue;
+        if (any < 0 || ch[k] < any) any = ch[k];
+        if (resid[ch[k]] != 0 && (low < 0 || ch[k] < low)) low = ch[k];
+    }
+    const int dup = low >= 0 ? low : any;
+    for (int k = 0; k < K; ++k)
+        if (!keep[k]) ch[k] = dup;
+    *sum = s;
+    return s;
+}
 // Single-warp zero-barrier router for E <= 512: each lane holds <= 16 experts in registers.
 __global__ void route_warp_kernel(const float* logits, const float* bias, int T, int E, int K, float scale, int* top,
-                                  float* w) {
+                                  float* w, const uint8_t* resid, int tail_n) {
     const int t = blockIdx.x, lane = threadIdx.x;   // 32 threads
     const float* l = logits + (size_t) t * E;
     float val[16];
@@ -2223,6 +2246,27 @@ __global__ void route_warp_kernel(const float* logits, const float* bias, int T,
         if (idx < E && (idx & 31) == lane) val[idx >> 5] = -INFINITY;
     }
     if (lane == 0) {
+        if (tail_n > 0 && resid) {   // (IK2_TAIL_SKIP: the deep picks the tier does not hold, left out)
+            float sc[kRouteMax];
+            for (int k = 0; k < K; ++k) sc[k] = 1.0f / (1.0f + expf(-__ldg(l + ch[k])));
+            bool keep[kRouteMax];
+            float sum = 0.0f;
+            tail_skip_picks(ch, sc, K, resid, tail_n, keep, &sum);
+            float wv[kRouteMax];
+            for (int k = 0; k < K; ++k) wv[k] = keep[k] ? sc[k] / (sum + 1e-20f) * scale : 0.0f;
+            for (int a = 1; a < K; ++a) {   // ascending expert order, the weights along
+                const int x = ch[a];
+                const float wx = wv[a];
+                int b = a - 1;
+                for (; b >= 0 && ch[b] > x; --b) ch[b + 1] = ch[b], wv[b + 1] = wv[b];
+                ch[b + 1] = x, wv[b + 1] = wx;
+            }
+            for (int k = 0; k < K; ++k) {
+                top[(size_t) t * K + k] = ch[k];
+                w[(size_t) t * K + k] = wv[k];
+            }
+            return;
+        }
         for (int a = 1; a < K; ++a) {   // ascending expert order
             const int x = ch[a];
             int b = a - 1;
@@ -2240,7 +2284,7 @@ __global__ void route_warp_kernel(const float* logits, const float* bias, int T,
 
 // a block a token: the scores in shared memory, then K rounds of the block's argmax (ties: the lower expert)
 __global__ void route_kernel(const float* logits, const float* bias, int T, int E, int K, float scale, int* top,
-                             float* w) {
+                             float* w, const uint8_t* resid, int tail_n) {
     extern __shared__ float v[];   // [E]
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -2273,6 +2317,27 @@ __global__ void route_kernel(const float* logits, const float* bias, int T, int 
         __syncthreads();
     }
     if (tid == 0) {
+        if (tail_n > 0 && resid) {   // (IK2_TAIL_SKIP: as route_warp_kernel's - one thread, the block's scores in v)
+            float sc[kRouteMax];
+            for (int k = 0; k < K; ++k) sc[k] = 1.0f / (1.0f + expf(-l[ch[k]]));
+            bool keep[kRouteMax];
+            float sum = 0.0f;
+            tail_skip_picks(ch, sc, K, resid, tail_n, keep, &sum);
+            float wv[kRouteMax];
+            for (int k = 0; k < K; ++k) wv[k] = keep[k] ? sc[k] / (sum + 1e-20f) * scale : 0.0f;
+            for (int a = 1; a < K; ++a) {   // ascending expert order, the weights along
+                const int x = ch[a];
+                const float wx = wv[a];
+                int b = a - 1;
+                for (; b >= 0 && ch[b] > x; --b) ch[b + 1] = ch[b], wv[b + 1] = wv[b];
+                ch[b + 1] = x, wv[b + 1] = wx;
+            }
+            for (int k = 0; k < K; ++k) {
+                top[(size_t) t * K + k] = ch[k];
+                w[(size_t) t * K + k] = wv[k];
+            }
+            return;
+        }
         int c[kRouteMax];
         for (int k = 0; k < K; ++k) c[k] = ch[k];
         for (int a = 1; a < K; ++a) {   // ascending expert order
@@ -4975,7 +5040,7 @@ __global__ void route_token_kernel(const float* __restrict__ logits, const float
                                    float scale, const uint8_t* const* __restrict__ tab, const float* __restrict__ sg_t,
                                    const float* __restrict__ su_t, const float* __restrict__ sd_t, int* top, float* w,
                                    const uint8_t** blob, int* tok, int* inv, float* sg, float* su, float* wt,
-                                   const float* x, int width, uint16_t* x_limbs) {
+                                   const float* x, int width, uint16_t* x_limbs, const uint8_t* resid, int tail_n) {
     if (blockIdx.x) {   // (the blocks after the first: x = hi + lo in FP16, [2][width] - experts_gate_up_swiglu_mma's input)
         const int i = (blockIdx.x - 1) * blockDim.x + threadIdx.x;
         if (i < width) {
@@ -4988,6 +5053,7 @@ __global__ void route_token_kernel(const float* __restrict__ logits, const float
     float* val = rt_sm;                                       // [E] sigmoid + bias
     uint32_t* picked = (uint32_t*) (rt_sm + E);               // [warps] a warp's picks, a bit a lane
     float* sig = (float*) (picked + (blockDim.x >> 5));       // [K] the picks' sigmoids in order, [K]: their sum
+    int* rks = (int*) (sig + K + 1);                          // [K] the picks' ranks (IK2_TAIL_SKIP)
     const int e = threadIdx.x, lane = e & 31, warp = e >> 5;
     const float sl = e < E ? 1.0f / (1.0f + expf(-__ldg(logits + e))) : 0.0f;
     const float v = e < E ? sl + __ldg(bias + e) : -INFINITY;
@@ -5004,7 +5070,7 @@ __global__ void route_token_kernel(const float* __restrict__ logits, const float
     __syncthreads();
     int pos = __popc(mine & ((1u << lane) - 1u));
     for (int ww = 0; ww < warp; ++ww) pos += __popc(picked[ww]);
-    if (pick) sig[pos] = sl;
+    if (pick) sig[pos] = sl, rks[pos] = rank;
     __syncthreads();
     if (e == 0) {   // (the sum in route's order: the same weights to the bit)
         float sum = 0.0f;
@@ -5022,6 +5088,32 @@ __global__ void route_token_kernel(const float* __restrict__ logits, const float
         sg[pos] = sg_t ? sg_t[e] : 1.0f;
         su[pos] = su_t ? su_t[e] : 1.0f;
         wt[pos] = wk * (sd_t ? sd_t[e] : 1.0f);
+    }
+    if (tail_n > 0 && resid) {   // (IK2_TAIL_SKIP: the deep picks the tier does not hold, left out of the K slots)
+        __syncthreads();
+        if (e == 0) {
+            bool keep[kRouteMax];
+            float sum = 0.0f;
+            int low = -1, any = -1;   // (as route_warp_kernel's: the lowest kept expert in VRAM, else the lowest kept)
+            for (int k = 0; k < K; ++k) {
+                keep[k] = rks[k] < tail_n || resid[top[k]] != 0;
+                if (keep[k]) sum += sig[k];
+            }
+            for (int k = 0; k < K; ++k) {
+                if (!keep[k]) continue;
+                if (any < 0 || top[k] < any) any = top[k];
+                if (resid[top[k]] != 0 && (low < 0 || top[k] < low)) low = top[k];
+            }
+            const int dup = low >= 0 ? low : any;
+            for (int k = 0; k < K; ++k) {
+                const int en = keep[k] ? top[k] : dup;   // (a left-out slot: a resident pick's expert, at weight 0)
+                const float wk = keep[k] ? sig[k] / (sum + 1e-20f) * scale : 0.0f;
+                top[k] = en, w[k] = wk, wt[k] = wk * (sd_t ? sd_t[en] : 1.0f);
+                blob[k] = tab[en];
+                sg[k] = sg_t ? sg_t[en] : 1.0f;
+                su[k] = su_t ? su_t[en] : 1.0f;
+            }
+        }
     }
 }
 
@@ -6278,11 +6370,12 @@ __global__ void experts_down_mem_kernel(const uint8_t* const* blob, const int* n
 
 // route() for a window, a block of E threads a token (route_token_kernel's picks: the same weights to the bit)
 __global__ void route_rows_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int E, int K,
-                                  float scale, int* top, float* w) {
+                                  float scale, int* top, float* w, const uint8_t* resid, int tail_n) {
     extern __shared__ float rr_sm[];
     float* val = rr_sm;
     uint32_t* picked = (uint32_t*) (rr_sm + E);
     float* sig = (float*) (picked + (blockDim.x >> 5));
+    int* rks = (int*) (sig + K + 1);   // [K] the picks' ranks (IK2_TAIL_SKIP)
     const int t = blockIdx.x, e = threadIdx.x, lane = e & 31, warp = e >> 5;
     const float* lg = logits + (size_t) t * E;
     const float sl = e < E ? 1.0f / (1.0f + expf(-__ldg(lg + e))) : 0.0f;
@@ -6300,7 +6393,7 @@ __global__ void route_rows_kernel(const float* __restrict__ logits, const float*
     __syncthreads();
     int pos = __popc(mine & ((1u << lane) - 1u));
     for (int ww = 0; ww < warp; ++ww) pos += __popc(picked[ww]);
-    if (pick) sig[pos] = sl;
+    if (pick) sig[pos] = sl, rks[pos] = rank;
     __syncthreads();
     if (e == 0) {
         float sum = 0.0f;
@@ -6309,6 +6402,30 @@ __global__ void route_rows_kernel(const float* __restrict__ logits, const float*
     }
     __syncthreads();
     if (pick) top[(size_t) t * K + pos] = e, w[(size_t) t * K + pos] = sl / (sig[K] + 1e-20f) * scale;
+    if (tail_n > 0 && resid) {   // (IK2_TAIL_SKIP: as route_token_kernel's - this token's deep non-resident picks out)
+        __syncthreads();
+        if (e == 0) {
+            bool keep[kRouteMax];
+            float sum = 0.0f;
+            int low = -1, any = -1;
+            int* tp = top + (size_t) t * K;
+            float* wq = w + (size_t) t * K;
+            for (int k = 0; k < K; ++k) {
+                keep[k] = rks[k] < tail_n || resid[tp[k]] != 0;
+                if (keep[k]) sum += sig[k];
+            }
+            for (int k = 0; k < K; ++k) {
+                if (!keep[k]) continue;
+                if (any < 0 || tp[k] < any) any = tp[k];
+                if (resid[tp[k]] != 0 && (low < 0 || tp[k] < low)) low = tp[k];
+            }
+            const int dup = low >= 0 ? low : any;
+            for (int k = 0; k < K; ++k) {
+                if (keep[k]) wq[k] = sig[k] / (sum + 1e-20f) * scale;
+                else tp[k] = dup, wq[k] = 0.0f;
+            }
+        }
+    }
 }
 
 // a lane's part of a Q8_0 block of its two rows (34 bytes: the FP16 scale, 32 int8): the scales, and the values
@@ -6713,23 +6830,84 @@ void gate_mul_f16(float* o, const float* g, size_t n, uint16_t* o16, bool write_
 }
 
 void route(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
-           cudaStream_t s) {
+           cudaStream_t s, const uint8_t* resid, int tail_n) {
     if (T <= 0) return;
+    if ((tail_n > 0) != (resid != nullptr)) tail_n = 0;   // (IK2_TAIL_SKIP needs the tier's table)
     if (K < 1 || K > kRouteMax) {
         std::fprintf(stderr, "ik2::k::route: K %d\n", K);
         std::abort();
     }
     if (E <= 512) {
-        route_warp_kernel<<<T, 32, 0, s>>>(logits, bias, T, E, K, scale, top, w);
+        route_warp_kernel<<<T, 32, 0, s>>>(logits, bias, T, E, K, scale, top, w, resid, tail_n);
         check("route_warp");
         return;
     }
-    route_kernel<<<T, 128, (size_t) E * 4, s>>>(logits, bias, T, E, K, scale, top, w);
+    route_kernel<<<T, 128, (size_t) E * 4, s>>>(logits, bias, T, E, K, scale, top, w, resid, tail_n);
     check("route");
 }
 
-void gather_f16(const float* x, const int* idx, int n, int C, uint16_t* y, cudaStream_t s) {
-    if (n <= 0) return;
+// (IK2_CACHE_BIAS's measurement: a token's router scores (sigmoid + the bias table) - their sum and sum of squares,
+//  and the top-8 cut's gap, the 8th largest minus the 9th: how far F must move an expert to cross the pick.  acc
+//  [4]: sum, sum of squares, the tokens, the gaps; atomicAdd'd over the tokens and read once at the end.)
+__global__ void route_stats_kernel(const float* logits, const float* bias, int T, int E, double* acc) {
+    extern __shared__ float v[];
+    const int t = blockIdx.x, tid = threadIdx.x;
+    const float* l = logits + (size_t) t * E;
+    __shared__ float rs[128];
+    __shared__ int victim;
+    float s = 0.0f, ss = 0.0f;
+    for (int e = tid; e < E; e += blockDim.x) {
+        const float x = 1.0f / (1.0f + expf(-__ldg(l + e))) + __ldg(bias + e);
+        v[e] = x, s += x, ss += x * x;
+    }
+    rs[tid] = s;
+    __syncthreads();
+    for (int o = blockDim.x >> 1; o > 0; o >>= 1) {
+        if (tid < o) rs[tid] += rs[tid + o];
+        __syncthreads();
+    }
+    const float ssum = rs[0];
+    rs[tid] = ss;
+    __syncthreads();
+    for (int o = blockDim.x >> 1; o > 0; o >>= 1) {
+        if (tid < o) rs[tid] += rs[tid + o];
+        __syncthreads();
+    }
+    if (tid == 0) atomicAdd(&acc[0], (double) ssum), atomicAdd(&acc[1], (double) rs[0]), atomicAdd(&acc[2], 1.0);
+    float v8 = 0.0f, v9 = 0.0f;
+    for (int r = 0; r < 9; ++r) {
+        float best = -INFINITY;
+        for (int e = tid; e < E; e += blockDim.x) best = fmaxf(best, v[e]);
+        rs[tid] = best;
+        __syncthreads();
+        for (int o = blockDim.x >> 1; o > 0; o >>= 1) {
+            if (tid < o) rs[tid] = fmaxf(rs[tid], rs[tid + o]);
+            __syncthreads();
+        }
+        const float m = rs[0];
+        if (r == 7) v8 = m;
+        if (r == 8) v9 = m;
+        if (r < 8) {   // (one instance of the max out - the lowest element that holds it)
+            if (tid == 0) victim = 0;
+            __syncthreads();
+            for (int e = tid; e < E; e += blockDim.x)
+                if (v[e] == m && atomicExch(&victim, 1) == 0) {
+                    v[e] = -INFINITY;
+                    break;
+                }
+            __syncthreads();
+        }
+    }
+    if (tid == 0) atomicAdd(&acc[3], (double) (v8 - v9)), atomicAdd(&acc[4], (double) v8);
+}
+
+void route_stats(const float* logits, const float* bias, int T, int E, double* acc, cudaStream_t s) {
+    if (T <= 0 || E <= 0) return;
+    route_stats_kernel<<<T, 128, (size_t) E * 4, s>>>(logits, bias, T, E, acc);
+    check("route_stats");
+}
+
+void gather_f16(const float* x, const int* idx, int n, int C, uint16_t* y, cudaStream_t s) {    if (n <= 0) return;
     gather_f16_kernel<<<grid((size_t) n * C), kBlk, 0, s>>>(x, idx, n, C, y);
     check("gather_f16");
 }
@@ -7602,17 +7780,19 @@ void route_gather(const int* top, const float* w, const uint8_t* const* tab, con
 void route_token(const float* logits, const float* bias, int E, int K, float scale, const uint8_t* const* tab,
                  const float* sg_t, const float* su_t, const float* sd_t, int* top, float* w, const uint8_t** blob,
                  int* tok, int* inv, float* sg, float* su, float* wt, cudaStream_t s, const float* x, int width,
-                 uint16_t* x_limbs) {
+                 uint16_t* x_limbs, const uint8_t* resid, int tail_n) {
     if (E > 1024 || K > E) {   // (more experts than a block's threads: the two kernels)
         if (x_limbs) to_f16_limbs(x, (size_t) width, x_limbs, s);
-        route(logits, bias, 1, E, K, scale, top, w, s);
+        route(logits, bias, 1, E, K, scale, top, w, s, resid, tail_n);
         route_gather(top, w, tab, sg_t, su_t, sd_t, K, K, blob, tok, inv, sg, su, wt, s);
         return;
     }
+    if ((tail_n > 0) != (resid != nullptr)) tail_n = 0;
     const unsigned nt = (unsigned) ((E + 31) / 32 * 32);
     const unsigned blocks = 1 + (x_limbs ? (width + nt - 1) / nt : 0);
-    route_token_kernel<<<blocks, nt, (size_t) (E + nt / 32 + K + 1) * sizeof(float), s>>>(
-        logits, bias, E, K, scale, tab, sg_t, su_t, sd_t, top, w, blob, tok, inv, sg, su, wt, x, width, x_limbs);
+    route_token_kernel<<<blocks, nt, (size_t) (E + nt / 32 + K + 1 + K) * sizeof(float), s>>>(
+        logits, bias, E, K, scale, tab, sg_t, su_t, sd_t, top, w, blob, tok, inv, sg, su, wt, x, width, x_limbs, resid,
+        tail_n);
     check("route_token");
 }
 
@@ -7922,15 +8102,16 @@ void attn_res_jobs_block(const ResStates& states, int n, const float* q, int nq,
 }
 
 void route_rows(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
-                cudaStream_t s) {
+                cudaStream_t s, const uint8_t* resid, int tail_n) {
     if (T <= 0) return;
     if (E > 1024 || K > E || K > kRouteMax) {
-        route(logits, bias, T, E, K, scale, top, w, s);
+        route(logits, bias, T, E, K, scale, top, w, s, resid, tail_n);
         return;
     }
+    if ((tail_n > 0) != (resid != nullptr)) tail_n = 0;
     const unsigned nt = (unsigned) ((E + 31) / 32 * 32);
-    route_rows_kernel<<<(unsigned) T, nt, (size_t) (E + nt / 32 + K + 1) * sizeof(float), s>>>(logits, bias, E, K,
-                                                                                               scale, top, w);
+    route_rows_kernel<<<(unsigned) T, nt, (size_t) (E + nt / 32 + K + 1 + K) * sizeof(float), s>>>(
+        logits, bias, E, K, scale, top, w, resid, tail_n);
     check("route_rows");
 }
 void experts_block_gu_q8(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,

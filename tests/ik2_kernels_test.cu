@@ -441,6 +441,148 @@ void test_route() {
         expect_true("route_token: route and route_gather's values to the bit (40 tokens, ties among them)", same);
         cudaFree(dtab), cudaFree(dsg), cudaFree(dsu), cudaFree(dsd);
     }
+    // IK2_TAIL_SKIP: the picks of rank N and past it that the tier does not hold are left out - the slot takes a
+    // resident kept pick's expert at weight 0 - and the kept weights sum to the scale the full K summed to.  The
+    // expected values are the same rule on the host, float for float.
+    {
+        const int N = 4;   // (ranks 4 .. K-1 drop when not resident)
+        std::vector<uint8_t> res(E);
+        for (int e = 0; e < E; ++e) res[(size_t) e] = (uint8_t) (e % 3 != 0);   // (two in three in VRAM)
+        uint8_t* dres = dev(res);
+        const auto one = [&](int t) {
+            std::vector<std::pair<double, int>> v(E);
+            for (int e = 0; e < E; ++e)
+                v[(size_t) e] = {-(1.0 / (1.0 + std::exp(-(double) lg[(size_t) t * E + e])) + bias[(size_t) e]), e};
+            std::sort(v.begin(), v.end());
+            std::vector<float> sig((size_t) K);
+            std::vector<bool> keep(K);
+            for (int r = 0; r < K; ++r) {
+                sig[(size_t) r] = (float) (1.0 / (1.0 + std::exp(-(double) lg[(size_t) t * E + v[(size_t) r].second])));
+                keep[(size_t) r] = r < N || res[(size_t) v[(size_t) r].second] != 0;
+            }
+            float sum = 0.0f;
+            for (int r = 0; r < K; ++r)
+                if (keep[(size_t) r]) sum += sig[(size_t) r];
+            int low = -1, any = -1;
+            for (int r = 0; r < K; ++r) {
+                if (!keep[(size_t) r]) continue;
+                const int e = v[(size_t) r].second;
+                if (any < 0 || e < any) any = e;
+                if (res[(size_t) e] && (low < 0 || e < low)) low = e;
+            }
+            const int dup = low >= 0 ? low : any;
+            std::vector<std::pair<int, float>> want;   // (expert, weight), the slots sorted by expert
+            for (int r = 0; r < K; ++r)
+                want.push_back({keep[(size_t) r] ? v[(size_t) r].second : dup,
+                                keep[(size_t) r] ? sig[(size_t) r] / (sum + 1e-20f) * 8.0f : 0.0f});
+            std::sort(want.begin(), want.end());
+            return want;
+        };
+        bool picks = true, sums = true;
+        float worst = 0.0f;
+        for (int t = 0; t < 64; ++t) {
+            std::vector<float> row(lg.begin() + (size_t) t * E, lg.begin() + (size_t) (t + 1) * E);
+            float* dr = dev(row);
+            float* db = dev(bias);
+            int* dt = dev_n<int>(K);
+            float* dw = dev_n<float>(K);
+            k::route(dr, db, 1, E, K, 8.0f, dt, dw, 0, dres, N);
+            const auto got_t = host(dt, K);
+            const auto got_w = host(dw, K);
+            std::vector<std::pair<int, float>> got;
+            float ws = 0.0f;
+            for (int k = 0; k < K; ++k) got.push_back({got_t[(size_t) k], got_w[(size_t) k]}), ws += got_w[(size_t) k];
+            std::sort(got.begin(), got.end());
+            const auto want = one(t);
+            for (int k = 0; k < K; ++k) {
+                picks &= got[(size_t) k].first == want[(size_t) k].first;
+                worst = std::max(worst, std::fabs(got[(size_t) k].second - want[(size_t) k].second));
+            }
+            sums &= std::fabs(ws - 8.0f) <= 1e-5f;   // (the scale the full K summed to: not left short)
+            cudaFree(dr), cudaFree(db), cudaFree(dt), cudaFree(dw);
+        }
+        expect_true("route (IK2_TAIL_SKIP): the kept picks and the resident duplicate's expert", picks);
+        expect_true("route (IK2_TAIL_SKIP): the kept weights sum to the scale", sums);
+        expect_true("route (IK2_TAIL_SKIP): the weights are the host rule's", worst <= 2e-5f);
+        // the same rule in route_token's one launch (the decode path): its top / w agree with route + gather's
+        {
+            std::vector<const uint8_t*> tab(E);
+            for (int e = 0; e < E; ++e) tab[e] = (const uint8_t*) (uintptr_t) (0x1000 + 64 * e);
+            auto sgt = fvec(E, 2.0f), sut = fvec(E, 2.0f), sdt = fvec(E, 2.0f);
+            const uint8_t** dtab = dev(tab);
+            float *dsg = dev(sgt), *dsu = dev(sut), *dsd = dev(sdt);
+            bool same = true;
+            for (int t = 0; t < 16; ++t) {
+                std::vector<float> row(lg.begin() + (size_t) t * E, lg.begin() + (size_t) (t + 1) * E);
+                float* dr = dev(row);
+                float* db = dev(bias);
+                int *ta = dev_n<int>(K), *tb = dev_n<int>(K);
+                float *wa = dev_n<float>(K), *wb = dev_n<float>(K);
+                const uint8_t **ba = dev_n<const uint8_t*>(K), **bb = dev_n<const uint8_t*>(K);
+                int* kk = dev_n<int>(K);
+                int* ii = dev_n<int>(K);
+                float *g = dev_n<float>(K), *u = dev_n<float>(K), *x = dev_n<float>(K);
+                k::route(dr, db, 1, E, K, 8.0f, ta, wa, 0, dres, N);
+                k::route_gather(ta, wa, dtab, dsg, dsu, dsd, K, K, ba, kk, ii, g, u, x, 0);
+                k::route_token(dr, db, E, K, 8.0f, dtab, dsg, dsu, dsd, tb, wb, bb, kk, ii, g, u, x, 0, nullptr, 0,
+                               nullptr, dres, N);
+                // (the picks as a set: the duplicate slots' place among equal experts is any)
+                struct Slot {
+                    int e;
+                    float w;
+                    const uint8_t* b;
+                    bool operator<(const Slot& o) const { return e < o.e || (e == o.e && w < o.w); }
+                };
+                auto slots = [&](int* tt, float* ww, const uint8_t** bb) {
+                    const auto th = host(tt, K);
+                    const auto wh = host(ww, K);
+                    const auto bh = host(bb, K);
+                    std::vector<Slot> p;
+                    for (int k = 0; k < K; ++k) p.push_back({th[(size_t) k], wh[(size_t) k], bh[(size_t) k]});
+                    std::sort(p.begin(), p.end());
+                    return p;
+                };
+                const auto pa = slots(ta, wa, ba), pb = slots(tb, wb, bb);
+                for (int k = 0; k < K; ++k) {
+                    same &= pa[(size_t) k].e == pb[(size_t) k].e;
+                    same &= std::fabs(pa[(size_t) k].w - pb[(size_t) k].w) <= 2e-6f;
+                    same &= pa[(size_t) k].b == pb[(size_t) k].b;
+                }
+                for (int* q : {ta, tb, kk, ii}) cudaFree(q);
+                for (float* q : {wa, wb, g, u, x, dr, db}) cudaFree(q);
+                cudaFree(ba), cudaFree(bb);
+            }
+            expect_true("route_token (IK2_TAIL_SKIP): the same picks and weights as route + gather", same);
+            cudaFree(dtab), cudaFree(dsg), cudaFree(dsu), cudaFree(dsd);
+        }
+        {   // route_rows: a window's path (a block a token), the same picks and weights as route's
+            const int T6 = 6;
+            int* ta = dev_n<int>((size_t) T6 * K);
+            int* tb = dev_n<int>((size_t) T6 * K);
+            float* wa = dev_n<float>((size_t) T6 * K);
+            float* wb = dev_n<float>((size_t) T6 * K);
+            k::route(dl, db, T6, E, K, 8.0f, ta, wa, 0, dres, N);
+            k::route_rows(dl, db, T6, E, K, 8.0f, tb, wb, 0, dres, N);
+            const auto ha = host(wa, (size_t) T6 * K), hb = host(wb, (size_t) T6 * K);
+            const auto ta_h = host(ta, (size_t) T6 * K), tb_h = host(tb, (size_t) T6 * K);
+            bool ok = true;
+            for (int t = 0; t < T6; ++t) {   // (a token's picks as a set: the duplicate's place among equal experts is any)
+                std::vector<std::pair<int, float>> pa, pb;
+                for (int k = 0; k < K; ++k) {
+                    pa.push_back({ta_h[(size_t) t * K + k], ha[(size_t) t * K + k]});
+                    pb.push_back({tb_h[(size_t) t * K + k], hb[(size_t) t * K + k]});
+                }
+                std::sort(pa.begin(), pa.end());
+                std::sort(pb.begin(), pb.end());
+                for (int k = 0; k < K; ++k)
+                    ok &= pa[(size_t) k].first == pb[(size_t) k].first &&
+                          std::fabs(pa[(size_t) k].second - pb[(size_t) k].second) <= 2e-6f;
+            }
+            expect_true("route_rows (IK2_TAIL_SKIP): the same picks and weights as route", ok);
+            cudaFree(ta), cudaFree(tb), cudaFree(wa), cudaFree(wb);
+        }
+        cudaFree(dres);
+    }
     cudaFree(dl), cudaFree(db), cudaFree(dw), cudaFree(dt);
 }
 

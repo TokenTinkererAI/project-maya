@@ -132,11 +132,18 @@ void gate_mul_f16(float* o, const float* g, size_t n, uint16_t* o16, bool write_
 
 /// The router over logits [T][E]: sc = sigmoid; the K largest of sc + bias (ties: the lower expert) -> top [T][K] in
 /// ascending expert order, w [T][K] = sc / (sum of the chosen + 1e-20) * scale.
+/// resid (IK2_TAIL_SKIP, with tail_n > 0): [E] 1 where the expert is in the VRAM tier; a pick of rank >= tail_n that
+/// is not resident is left out (its slot takes a resident pick's expert at weight 0) and the kept picks' weights
+/// rescaled to sum to `scale`.
 void route(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
-           cudaStream_t s);
+           cudaStream_t s, const uint8_t* resid = nullptr, int tail_n = 0);
 
 /// FP16 rows gathered from F32 rows: y [n][C] = x[idx[i]][C].
 void gather_f16(const float* x, const int* idx, int n, int C, uint16_t* y, cudaStream_t s);
+
+/// IK2_CACHE_BIAS's measurement over logits [T][E]: acc [4] += the scores' sum, their sum of squares, the tokens, and
+/// the top-8 cut's gap (the 8th largest score minus the 9th).  Read at the end of the run.
+void route_stats(const float* logits, const float* bias, int T, int E, double* acc, cudaStream_t s);
 
 /// The experts' activation over gate | up rows: gu [n][2 F] FP16 (gate first), row i's scales sg[i], su[i] (the
 /// expert's NVFP4 scales; 1 without) -> h [n][F] FP16 = gcap tanh(g / gcap) sigmoid(g) ucap tanh(u / ucap),
@@ -337,7 +344,7 @@ void route_gather(const int* top, const float* w, const uint8_t* const* tab, con
 void route_token(const float* logits, const float* bias, int E, int K, float scale, const uint8_t* const* tab,
                  const float* sg_t, const float* su_t, const float* sd_t, int* top, float* w, const uint8_t** blob,
                  int* tok, int* inv, float* sg, float* su, float* wt, cudaStream_t s, const float* x = nullptr,
-                 int width = 0, uint16_t* x_limbs = nullptr);
+                 int width = 0, uint16_t* x_limbs = nullptr, const uint8_t* resid = nullptr, int tail_n = 0);
 /// prep_qkv_r_f16 / _fp8 of one token whose position is at pos (device): the cache slot from it, and with log_scale
 /// (a full layer) q's and r's tau.  q16 (given): an FP16 copy of the clipped q, [H][D] (attn_decode_mma's).
 /// sink_w (given): the token's sinks in the same launch, sink_y [H] = sink_w [H][sink_k] (FP16) . sink_x (mv_f16's).
@@ -496,7 +503,7 @@ void prep_qkv_r_f16_block(float* q, int q_ld, const float* q_clip, const float* 
                           const float* sink_x, int sink_k, float* sink_y);
 /// route() for a window, a block a token (the same picks and weights to the bit).
 void route_rows(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
-                cudaStream_t s);
+                cudaStream_t s, const uint8_t* resid = nullptr, int tail_n = 0);
 /// experts_block_gu / _down over Q8_0 experts (a block's sum scaled in FP32: the int8 values exact).
 void experts_block_gu_q8(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
                          size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su,
