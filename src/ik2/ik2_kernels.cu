@@ -2187,32 +2187,12 @@ __global__ void gate_mul_impl_kernel(float* o, const float* g, size_t n, uint16_
 }
 
 constexpr int kRouteMax = 16;
-// (IK2_TAIL_SKIP: ch[0..K) in rank order - the first `tail_n` ranks are kept, past them only an expert the tier holds;
-//  a left-out pick's slot takes the first kept resident expert (so nothing is fetched for it) at weight 0, and the kept
-//  picks' weights are rescaled to sum to `scale` - the total the full K summed to.  Returns the kept experts' sigmoid
-//  sum in *sum (rank order).  Call with tail_n > 0 and resid non-null only.)
-__device__ __forceinline__ float tail_skip_picks(int* ch, const float* sc, int K, const uint8_t* resid, int tail_n,
-                                                 bool* keep, float* sum) {
-    float s = 0.0f;
-    for (int k = 0; k < K; ++k) {
-        keep[k] = k < tail_n || resid[ch[k]] != 0;
-        if (keep[k]) s += sc[k];
-    }
-    int low = -1, any = -1;   // (the slot's placeholder: the lowest kept expert in VRAM, else the lowest kept)
-    for (int k = 0; k < K; ++k) {
-        if (!keep[k]) continue;
-        if (any < 0 || ch[k] < any) any = ch[k];
-        if (resid[ch[k]] != 0 && (low < 0 || ch[k] < low)) low = ch[k];
-    }
-    const int dup = low >= 0 ? low : any;
-    for (int k = 0; k < K; ++k)
-        if (!keep[k]) ch[k] = dup;
-    *sum = s;
-    return s;
-}
+// (IK2_TAIL_SKIP: a deep pick is left out only when it would add a fetch this batch does not otherwise make - see
+//  tail_seed_kernel / tail_mark_kernel / tail_apply_kernel below.  The routers themselves are the plain ones: they
+//  write the top-K by score and, when asked, each slot's rank (0 the best) for the tail pass to read.)
 // Single-warp zero-barrier router for E <= 512: each lane holds <= 16 experts in registers.
 __global__ void route_warp_kernel(const float* logits, const float* bias, int T, int E, int K, float scale, int* top,
-                                  float* w, const uint8_t* resid, int tail_n) {
+                                  float* w, uint8_t* rank_out) {
     const int t = blockIdx.x, lane = threadIdx.x;   // 32 threads
     const float* l = logits + (size_t) t * E;
     float val[16];
@@ -2246,45 +2226,28 @@ __global__ void route_warp_kernel(const float* logits, const float* bias, int T,
         if (idx < E && (idx & 31) == lane) val[idx >> 5] = -INFINITY;
     }
     if (lane == 0) {
-        if (tail_n > 0 && resid) {   // (IK2_TAIL_SKIP: the deep picks the tier does not hold, left out)
-            float sc[kRouteMax];
-            for (int k = 0; k < K; ++k) sc[k] = 1.0f / (1.0f + expf(-__ldg(l + ch[k])));
-            bool keep[kRouteMax];
-            float sum = 0.0f;
-            tail_skip_picks(ch, sc, K, resid, tail_n, keep, &sum);
-            float wv[kRouteMax];
-            for (int k = 0; k < K; ++k) wv[k] = keep[k] ? sc[k] / (sum + 1e-20f) * scale : 0.0f;
-            for (int a = 1; a < K; ++a) {   // ascending expert order, the weights along
-                const int x = ch[a];
-                const float wx = wv[a];
-                int b = a - 1;
-                for (; b >= 0 && ch[b] > x; --b) ch[b + 1] = ch[b], wv[b + 1] = wv[b];
-                ch[b + 1] = x, wv[b + 1] = wx;
-            }
-            for (int k = 0; k < K; ++k) {
-                top[(size_t) t * K + k] = ch[k];
-                w[(size_t) t * K + k] = wv[k];
-            }
-            return;
-        }
-        for (int a = 1; a < K; ++a) {   // ascending expert order
+        uint8_t rk[kRouteMax];
+        for (int k = 0; k < K; ++k) rk[k] = (uint8_t) k;
+        for (int a = 1; a < K; ++a) {   // ascending expert order, the ranks (and in the tail pass, the weights) along
             const int x = ch[a];
+            const uint8_t rx = rk[a];
             int b = a - 1;
-            for (; b >= 0 && ch[b] > x; --b) ch[b + 1] = ch[b];
-            ch[b + 1] = x;
+            for (; b >= 0 && ch[b] > x; --b) ch[b + 1] = ch[b], rk[b + 1] = rk[b];
+            ch[b + 1] = x, rk[b + 1] = rx;
         }
         float sc[kRouteMax], sum = 0.0f;
         for (int k = 0; k < K; ++k) sum += (sc[k] = 1.0f / (1.0f + expf(-__ldg(l + ch[k]))));
         for (int k = 0; k < K; ++k) {
             top[(size_t) t * K + k] = ch[k];
             w[(size_t) t * K + k] = sc[k] / (sum + 1e-20f) * scale;
+            if (rank_out) rank_out[(size_t) t * K + k] = rk[k];
         }
     }
 }
 
 // a block a token: the scores in shared memory, then K rounds of the block's argmax (ties: the lower expert)
 __global__ void route_kernel(const float* logits, const float* bias, int T, int E, int K, float scale, int* top,
-                             float* w, const uint8_t* resid, int tail_n) {
+                             float* w, uint8_t* rank_out) {
     extern __shared__ float v[];   // [E]
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -2317,41 +2280,77 @@ __global__ void route_kernel(const float* logits, const float* bias, int T, int 
         __syncthreads();
     }
     if (tid == 0) {
-        if (tail_n > 0 && resid) {   // (IK2_TAIL_SKIP: as route_warp_kernel's - one thread, the block's scores in v)
-            float sc[kRouteMax];
-            for (int k = 0; k < K; ++k) sc[k] = 1.0f / (1.0f + expf(-l[ch[k]]));
-            bool keep[kRouteMax];
-            float sum = 0.0f;
-            tail_skip_picks(ch, sc, K, resid, tail_n, keep, &sum);
-            float wv[kRouteMax];
-            for (int k = 0; k < K; ++k) wv[k] = keep[k] ? sc[k] / (sum + 1e-20f) * scale : 0.0f;
-            for (int a = 1; a < K; ++a) {   // ascending expert order, the weights along
-                const int x = ch[a];
-                const float wx = wv[a];
-                int b = a - 1;
-                for (; b >= 0 && ch[b] > x; --b) ch[b + 1] = ch[b], wv[b + 1] = wv[b];
-                ch[b + 1] = x, wv[b + 1] = wx;
-            }
-            for (int k = 0; k < K; ++k) {
-                top[(size_t) t * K + k] = ch[k];
-                w[(size_t) t * K + k] = wv[k];
-            }
-            return;
-        }
         int c[kRouteMax];
-        for (int k = 0; k < K; ++k) c[k] = ch[k];
-        for (int a = 1; a < K; ++a) {   // ascending expert order
+        uint8_t rk[kRouteMax];
+        for (int k = 0; k < K; ++k) c[k] = ch[k], rk[k] = (uint8_t) k;
+        for (int a = 1; a < K; ++a) {   // ascending expert order, the ranks along
             const int x = c[a];
+            const uint8_t rx = rk[a];
             int b = a - 1;
-            for (; b >= 0 && c[b] > x; --b) c[b + 1] = c[b];
-            c[b + 1] = x;
+            for (; b >= 0 && c[b] > x; --b) c[b + 1] = c[b], rk[b + 1] = rk[b];
+            c[b + 1] = x, rk[b + 1] = rx;
         }
         float sc[kRouteMax], sum = 0.0f;
         for (int k = 0; k < K; ++k) sum += (sc[k] = 1.0f / (1.0f + expf(-l[c[k]])));
         for (int k = 0; k < K; ++k) {
             top[(size_t) t * K + k] = c[k];
             w[(size_t) t * K + k] = sc[k] / (sum + 1e-20f) * scale;
+            if (rank_out) rank_out[(size_t) t * K + k] = rk[k];
         }
+    }
+}
+
+// (IK2_TAIL_SKIP, the batch's rule: a pick of rank `tail_n` or past it is left out only when its expert is in no
+//  other slot of this routing's batch and not in the tier either - i.e. only when keeping it would add a fetch.  At
+//  a decode's T = 1 that is the old rule exactly (the picks are distinct experts, so a deep pick is resident or
+//  fetched for it alone); over a prompt's tokens it is what makes the knob honest: at 2,048 tokens nearly every
+//  expert is fetched for some token anyway, so the old rule dropped picks for no copy saved.)
+__global__ void tail_seed_kernel(int* need, const uint8_t* resid, int E) {
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < E; e += blockDim.x * gridDim.x) need[e] = resid[e];
+}
+// a deep pick's expert is needed by this batch when it is some token's rank < tail_n pick: that pick is always kept
+__global__ void tail_mark_kernel(const int* top, const uint8_t* rank, int S, int tail_n, int* need) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < S; i += blockDim.x * gridDim.x)
+        if (rank[i] < tail_n) atomicOr(&need[top[i]], 1);
+}
+// one thread a token: the kept picks (rank < tail_n or an expert the batch needs) rescaled to sum to `scale`; a
+// left-out slot takes the lowest kept expert in the tier at weight 0 (the lowest kept one if the tier holds none of
+// them), so nothing is fetched for it
+__global__ void tail_apply_kernel(int* top, float* w, const uint8_t* rank, const int* need, const uint8_t* resid, int K,
+                                  int tail_n, float scale) {
+    const int t = blockIdx.x;
+    if (threadIdx.x) return;
+    int* tp = top + (size_t) t * K;
+    float* wq = w + (size_t) t * K;
+    const uint8_t* rk = rank + (size_t) t * K;
+    bool keep[kRouteMax];
+    int nkeep = 0;
+    for (int k = 0; k < K; ++k) {
+        keep[k] = rk[k] < tail_n || need[tp[k]] != 0;
+        nkeep += keep[k] ? 1 : 0;
+    }
+    if (nkeep == K) return;   // (nothing left out: the router's own weights, to the bit)
+    float sum = 0.0f;
+    for (int k = 0; k < K; ++k)
+        if (keep[k]) sum += wq[k];
+    int low = -1, any = -1;
+    for (int k = 0; k < K; ++k) {
+        if (!keep[k]) continue;
+        const int e = tp[k];
+        if (any < 0 || e < any) any = e;
+        if (resid[e] != 0 && (low < 0 || e < low)) low = e;
+    }
+    const int dup = low >= 0 ? low : any;
+    for (int k = 0; k < K; ++k) {
+        if (keep[k]) wq[k] = wq[k] / (sum + 1e-20f) * scale;
+        else tp[k] = dup, wq[k] = 0.0f;
+    }
+    for (int a = 1; a < K; ++a) {   // ascending expert order, the weights along
+        const int x = tp[a];
+        const float wx = wq[a];
+        int b = a - 1;
+        for (; b >= 0 && tp[b] > x; --b) tp[b + 1] = tp[b], wq[b + 1] = wq[b];
+        tp[b + 1] = x, wq[b + 1] = wx;
     }
 }
 
@@ -6370,7 +6369,7 @@ __global__ void experts_down_mem_kernel(const uint8_t* const* blob, const int* n
 
 // route() for a window, a block of E threads a token (route_token_kernel's picks: the same weights to the bit)
 __global__ void route_rows_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int E, int K,
-                                  float scale, int* top, float* w, const uint8_t* resid, int tail_n) {
+                                  float scale, int* top, float* w, uint8_t* rank_out) {
     extern __shared__ float rr_sm[];
     float* val = rr_sm;
     uint32_t* picked = (uint32_t*) (rr_sm + E);
@@ -6402,30 +6401,7 @@ __global__ void route_rows_kernel(const float* __restrict__ logits, const float*
     }
     __syncthreads();
     if (pick) top[(size_t) t * K + pos] = e, w[(size_t) t * K + pos] = sl / (sig[K] + 1e-20f) * scale;
-    if (tail_n > 0 && resid) {   // (IK2_TAIL_SKIP: as route_token_kernel's - this token's deep non-resident picks out)
-        __syncthreads();
-        if (e == 0) {
-            bool keep[kRouteMax];
-            float sum = 0.0f;
-            int low = -1, any = -1;
-            int* tp = top + (size_t) t * K;
-            float* wq = w + (size_t) t * K;
-            for (int k = 0; k < K; ++k) {
-                keep[k] = rks[k] < tail_n || resid[tp[k]] != 0;
-                if (keep[k]) sum += sig[k];
-            }
-            for (int k = 0; k < K; ++k) {
-                if (!keep[k]) continue;
-                if (any < 0 || tp[k] < any) any = tp[k];
-                if (resid[tp[k]] != 0 && (low < 0 || tp[k] < low)) low = tp[k];
-            }
-            const int dup = low >= 0 ? low : any;
-            for (int k = 0; k < K; ++k) {
-                if (keep[k]) wq[k] = sig[k] / (sum + 1e-20f) * scale;
-                else tp[k] = dup, wq[k] = 0.0f;
-            }
-        }
-    }
+    if (pick && rank_out) rank_out[(size_t) t * K + pos] = (uint8_t) rank;
 }
 
 // a lane's part of a Q8_0 block of its two rows (34 bytes: the FP16 scale, 32 int8): the scales, and the values
@@ -6829,6 +6805,48 @@ void gate_mul_f16(float* o, const float* g, size_t n, uint16_t* o16, bool write_
     check("gate_mul_f16");
 }
 
+// (IK2_TAIL_SKIP's batch scratch: the tier's table OR'd with the deep picks' experts, and each slot's rank.  One
+//  pair a device - a routing can run on either GPU of a pair.)
+constexpr int kTailDevMax = 16;
+int* g_tail_need[kTailDevMax] = {};
+uint8_t* g_tail_rank[kTailDevMax] = {};
+size_t g_tail_need_cap[kTailDevMax] = {}, g_tail_rank_cap[kTailDevMax] = {};
+// the scratch for E and S, grown as a chunk asks for more
+void tail_scratch(int E, size_t S, int** need, uint8_t** rank, cudaStream_t s) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= kTailDevMax) {
+        std::fprintf(stderr, "ik2::k::route: tail scratch on device %d\n", dev);
+        std::abort();
+    }
+    if ((size_t) E > g_tail_need_cap[dev]) {
+        if (g_tail_need[dev]) cudaFree(g_tail_need[dev]);
+        cudaMalloc(&g_tail_need[dev], (size_t) E * sizeof(int));
+        check("tail scratch");
+        g_tail_need_cap[dev] = (size_t) E;
+    }
+    if (S > g_tail_rank_cap[dev]) {
+        if (g_tail_rank[dev]) cudaFree(g_tail_rank[dev]);
+        cudaMalloc(&g_tail_rank[dev], S);
+        check("tail scratch");
+        g_tail_rank_cap[dev] = S;
+    }
+    *need = g_tail_need[dev], *rank = g_tail_rank[dev];
+}
+// the tail pass over a batch the router above has just written: need = the tier's residents, then every rank <
+//  tail_n pick's expert, then the per-token apply
+void tail_pass(int T, int E, int K, float scale, int* top, float* w, const uint8_t* resid, int tail_n, cudaStream_t s) {
+    int* need = nullptr;
+    uint8_t* rank = nullptr;
+    const int S = T * K;
+    tail_scratch(E, (size_t) S, &need, &rank, s);
+    tail_seed_kernel<<<(unsigned) std::min((E + 255) / 256, 64), 256, 0, s>>>(need, resid, E);
+    check("tail_seed");
+    tail_mark_kernel<<<(unsigned) std::min((S + 255) / 256, 1024), 256, 0, s>>>(top, rank, S, tail_n, need);
+    check("tail_mark");
+    tail_apply_kernel<<<(unsigned) T, 32, 0, s>>>(top, w, rank, need, resid, K, tail_n, scale);
+    check("tail_apply");
+}
 void route(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
            cudaStream_t s, const uint8_t* resid, int tail_n) {
     if (T <= 0) return;
@@ -6837,13 +6855,20 @@ void route(const float* logits, const float* bias, int T, int E, int K, float sc
         std::fprintf(stderr, "ik2::k::route: K %d\n", K);
         std::abort();
     }
-    if (E <= 512) {
-        route_warp_kernel<<<T, 32, 0, s>>>(logits, bias, T, E, K, scale, top, w, resid, tail_n);
-        check("route_warp");
-        return;
+    const bool tail = tail_n > 0 && resid != nullptr;
+    uint8_t* rank = nullptr;
+    if (tail) {   // (the table the tail pass reads; the router fills the ranks)
+        int* need = nullptr;
+        tail_scratch(E, (size_t) T * K, &need, &rank, s);
     }
-    route_kernel<<<T, 128, (size_t) E * 4, s>>>(logits, bias, T, E, K, scale, top, w, resid, tail_n);
-    check("route");
+    if (E <= 512) {
+        route_warp_kernel<<<T, 32, 0, s>>>(logits, bias, T, E, K, scale, top, w, rank);
+        check("route_warp");
+    } else {
+        route_kernel<<<T, 128, (size_t) E * 4, s>>>(logits, bias, T, E, K, scale, top, w, rank);
+        check("route");
+    }
+    if (tail) tail_pass(T, E, K, scale, top, w, resid, tail_n, s);
 }
 
 // (IK2_CACHE_BIAS's measurement: a token's router scores (sigmoid + the bias table) - their sum and sum of squares,
@@ -8109,10 +8134,17 @@ void route_rows(const float* logits, const float* bias, int T, int E, int K, flo
         return;
     }
     if ((tail_n > 0) != (resid != nullptr)) tail_n = 0;
+    const bool tail = tail_n > 0 && resid != nullptr;
+    uint8_t* rank = nullptr;
+    if (tail) {
+        int* need = nullptr;
+        tail_scratch(E, (size_t) T * K, &need, &rank, s);
+    }
     const unsigned nt = (unsigned) ((E + 31) / 32 * 32);
     route_rows_kernel<<<(unsigned) T, nt, (size_t) (E + nt / 32 + K + 1 + K) * sizeof(float), s>>>(
-        logits, bias, E, K, scale, top, w, resid, tail_n);
+        logits, bias, E, K, scale, top, w, rank);
     check("route_rows");
+    if (tail) tail_pass(T, E, K, scale, top, w, resid, tail_n, s);
 }
 void experts_block_gu_q8(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
                          size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su,

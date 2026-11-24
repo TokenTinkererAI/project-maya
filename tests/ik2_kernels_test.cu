@@ -441,9 +441,10 @@ void test_route() {
         expect_true("route_token: route and route_gather's values to the bit (40 tokens, ties among them)", same);
         cudaFree(dtab), cudaFree(dsg), cudaFree(dsu), cudaFree(dsd);
     }
-    // IK2_TAIL_SKIP: the picks of rank N and past it that the tier does not hold are left out - the slot takes a
-    // resident kept pick's expert at weight 0 - and the kept weights sum to the scale the full K summed to.  The
-    // expected values are the same rule on the host, float for float.
+    // IK2_TAIL_SKIP: a pick of rank N and past it is left out only when its expert is in neither the tier nor any
+    // other slot of this batch below the cut (so it would add a fetch) - the slot takes such a kept expert at weight
+    // 0, and the kept weights are rescaled to sum to the scale the full K summed to.  At T = 1 that is the per-token
+    // rule; the expected values below are the same rule on the host, float for float.
     {
         const int N = 4;   // (ranks 4 .. K-1 drop when not resident)
         std::vector<uint8_t> res(E);
@@ -580,6 +581,82 @@ void test_route() {
             }
             expect_true("route_rows (IK2_TAIL_SKIP): the same picks and weights as route", ok);
             cudaFree(ta), cudaFree(tb), cudaFree(wa), cudaFree(wb);
+        }
+        {   // a LARGE batch (1,024 rows): the rule is the batch's - a deep pick is left out only when no other token
+            // of the batch picks that expert below the cut, so at a prompt's size nearly every expert is needed and
+            // every pick is free to keep.  (The old per-token rule read the tier alone: at 2,048 rows it dropped
+            // deep picks whose experts the batch fetched anyway, and the NLL of the 2,048-token text rose by a nat.)
+            const int Tb = 1024;
+            auto lgb = fvec((size_t) Tb * E, 1.0f);
+            for (int t = 0; t < Tb; ++t)   // (the same order a token: experts 0 .. E-1 by score, expert 7 first for
+                for (int e = 0; e < E; ++e) lgb[(size_t) t * E + e] = 4.0f - 0.01f * e;   //  token 1 alone)
+            lgb[(size_t) 1 * E + 7] = 6.0f;
+            std::vector<uint8_t> resb(E, 1);
+            for (int e = N; e < K; ++e) resb[(size_t) e] = 0;   // (experts N .. K-1 not in VRAM)
+            auto biasb = bias;
+            std::fill(biasb.begin(), biasb.end(), 0.2f);   // (a flat bias: the scores' order is the logits')
+            uint8_t* dresb = dev(resb);
+            float* dlb = dev(lgb);
+            float* dbb = dev(biasb);
+            int* dtb = dev_n<int>((size_t) Tb * K);
+            float* dwb = dev_n<float>((size_t) Tb * K);
+            k::route(dlb, dbb, Tb, E, K, 8.0f, dtb, dwb, 0, dresb, N);
+            const auto gt = host(dtb, (size_t) Tb * K);
+            const auto gw = host(dwb, (size_t) Tb * K);
+            // the same rule on the host: the tier's table, then every rank < N pick of the batch
+            std::vector<int> need(resb.begin(), resb.end());
+            std::vector<std::vector<int>> pick((size_t) Tb, std::vector<int>(K));
+            std::vector<std::vector<double>> sig((size_t) Tb, std::vector<double>(K));
+            for (int t = 0; t < Tb; ++t) {
+                std::vector<std::pair<double, int>> v(E);
+                for (int e = 0; e < E; ++e)
+                    v[(size_t) e] = {-(1.0 / (1.0 + std::exp(-(double) lgb[(size_t) t * E + e])) + biasb[(size_t) e]), e};
+                std::sort(v.begin(), v.end());
+                for (int r = 0; r < K; ++r)
+                    pick[(size_t) t][(size_t) r] = v[(size_t) r].second,
+                    sig[(size_t) t][(size_t) r] = 1.0 / (1.0 + std::exp(-(double) lgb[(size_t) t * E + v[(size_t) r].second]));
+                for (int r = 0; r < N; ++r) need[(size_t) pick[(size_t) t][(size_t) r]] = 1;
+            }
+            bool bp = true, bw = true, bs = true, ball = true;
+            int ndropped = 0;
+            for (int t = 0; t < Tb; ++t) {
+                std::vector<bool> keep(K);
+                double sum = 0.0;
+                for (int r = 0; r < K; ++r) {
+                    keep[(size_t) r] = r < N || need[(size_t) pick[(size_t) t][(size_t) r]] != 0;
+                    if (keep[(size_t) r]) sum += sig[(size_t) t][(size_t) r];
+                }
+                int low = -1;
+                for (int r = 0; r < K; ++r)
+                    if (keep[(size_t) r] && resb[(size_t) pick[(size_t) t][(size_t) r]] &&
+                        (low < 0 || pick[(size_t) t][(size_t) r] < low))
+                        low = pick[(size_t) t][(size_t) r];
+                std::vector<std::pair<int, float>> want;
+                float ws = 0.0f;
+                for (int r = 0; r < K; ++r) {
+                    if (!keep[(size_t) r]) ++ndropped;
+                    want.push_back({keep[(size_t) r] ? pick[(size_t) t][(size_t) r] : low,
+                                    keep[(size_t) r] ? (float) (sig[(size_t) t][(size_t) r] / (sum + 1e-20) * 8.0) : 0.0f});
+                }
+                std::sort(want.begin(), want.end());
+                std::vector<std::pair<int, float>> got;
+                for (int k = 0; k < K; ++k) got.push_back({gt[(size_t) t * K + k], gw[(size_t) t * K + k]});
+                std::sort(got.begin(), got.end());
+                for (int k = 0; k < K; ++k) {
+                    bp &= got[(size_t) k].first == want[(size_t) k].first;
+                    bw &= std::fabs(got[(size_t) k].second - want[(size_t) k].second) <= 2e-5f;
+                    ws += got[(size_t) k].second;
+                    ball &= need[(size_t) got[(size_t) k].first] != 0;   // (no slot holds an expert nothing needs)
+                }
+                bs &= std::fabs(ws - 8.0f) <= 1e-5f;
+            }
+            expect_true("route (IK2_TAIL_SKIP): 1,024 rows, the batch's picks and the resident duplicate", bp);
+            expect_true("route (IK2_TAIL_SKIP): 1,024 rows, the weights are the host batch rule's", bw);
+            expect_true("route (IK2_TAIL_SKIP): 1,024 rows, the kept weights sum to the scale", bs);
+            expect_true("route (IK2_TAIL_SKIP): 1,024 rows, every slot's expert the batch needs", ball);
+            expect_true("route (IK2_TAIL_SKIP): 1,024 rows, the deep non-resident expert 7 kept (token 1's top pick)",
+                        ndropped > 0 && need[(size_t) 7] != 0);
+            cudaFree(dlb), cudaFree(dresb), cudaFree(dtb), cudaFree(dwb), cudaFree(dbb);
         }
         cudaFree(dres);
     }

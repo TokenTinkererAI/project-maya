@@ -154,8 +154,10 @@ expert on the CPU when that is sooner than its copy (NVFP4 experts, AVX-512). A 
 holds is biased by `IK2_CACHE_BIAS` (Maya's default 0.15, `0` turns it off) before the top-K pick, so a token spends
 its misses on the experts it keeps anyway: on an 8 GB card at 131K that is 29.0 -> 31.9 tok/s for +0.03 mean NLL and
 the same top-1 token at every one of 2,558 scored positions. `IK2_TAIL_SKIP=N` goes further and leaves out a pick of
-rank N+1 or past it that the cache does not hold (off by default: it costs more quality a point of speed than the bias
-does).
+rank N+1 or past it when its expert is in neither the cache nor any other token's pick of this routing (so keeping it
+would add a fetch: at a decode's one token that is the cache alone; over a prompt's 2,048 tokens nearly every expert is
+fetched for somebody anyway, so the prompt keeps its picks). Off by default: it costs more quality a point of speed
+than the bias does.
 
 **Two GPUs** (`--gpus 2`, outside the preview of section 8: with `IK2_UNSUPPORTED=1`): `IK2_EP=1` deals each layer's experts to both by how often they are picked
 (`IK2_EP_SPLIT`, GPU 1's share), each GPU with its own cache and link; attention and the KV cache stay on GPU 0.
