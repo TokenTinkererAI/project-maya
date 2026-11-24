@@ -71,12 +71,12 @@ class Names(unittest.TestCase):
         self.assertEqual(maya.choose_family(a, {}), "ik2")
 
     def test_its_own_defaults(self):
-        """Inkling-2-Mini has its own entry, its author's values (not Inkling-2-Small's): temperature 1.0, top-p 1.0,
-        no top-k, no penalties, its template's own level by name (high: 0.9); a config written by hand for
-        Inkling-2-Small keeps the PR's."""
+        """Inkling-2-Mini has its own entry, its author's sampling (not Inkling-2-Small's): temperature 1.0, top-p
+        1.0, no top-k, no penalties; Maya's own thinking level, low (0.2 - the model's card's is 0.9); a config
+        written by hand for Inkling-2-Small keeps the PR's."""
         mini = {"exe": "/b/maya-ik2", "installer": {"family": "ik2", "ik2_quant": Q.IK2_QUANT}}
         self.assertEqual(Q.model_key(mini), "ik2-mini")
-        self.assertEqual(Q.model_defaults(mini), ({"temperature": 1.0, "top_p": 1.0}, "high"))
+        self.assertEqual(Q.model_defaults(mini), ({"temperature": 1.0, "top_p": 1.0}, "low"))
         by_hand = {"exe": "build/maya-ik2", "model_name": "inkling-2-mini",
                    "args": ["--model", "Inkling-2-Mini-UD-Q4_K_XL.gguf"]}
         self.assertEqual(Q.model_key(by_hand), "ik2-mini")
@@ -324,7 +324,7 @@ class Steps(unittest.TestCase):
         self.assertEqual(cfg["exe"], str(maya.IK2_EXE))
         self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "262144", "--drafting", "auto"])
         self.assertEqual(cfg["env"], {"IK2_KV": "fp8"})
-        self.assertEqual((cfg["sampling"], cfg["reasoning_effort"]), ({"temperature": 1.0, "top_p": 1.0}, "high"))
+        self.assertEqual((cfg["sampling"], cfg["reasoning_effort"]), ({"temperature": 1.0, "top_p": 1.0}, "low"))
         self.assertEqual((cfg["model_name"], cfg["gpu"], cfg["tokenizer"]), ("inkling-2-mini", [1], str(tok)))
         inst = cfg["installer"]
         self.assertEqual((inst["family"], inst["ik2_quant"], inst["experimental"]), ("ik2", Q.IK2_QUANT, True))
@@ -449,7 +449,10 @@ class Steps(unittest.TestCase):
             self.assertEqual(cfg["vision"], v)
             self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "262144", "--drafting", "auto"])
             maya.write_config_ik2(args(), pc, {}, gguf, tok, 262144, self.root / "models", d)   # (--no-vision)
-            self.assertNotIn("vision", json.loads(path.read_text(encoding="utf-8")))
+            again = json.loads(path.read_text(encoding="utf-8"))
+            self.assertNotEqual(again.get("vision"), v)        # (the explicit block is gone)
+            if "vision" in again:                              # (the CPU encoder's default, where it is built)
+                self.assertNotIn("gpu", again["vision"])
 
     def test_a_start_of_it(self):
         d, gguf = self.files()

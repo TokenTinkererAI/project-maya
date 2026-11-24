@@ -50,11 +50,12 @@ MODEL_DEFAULTS = {
     # Inkling-2-Small (maya-ik2, docs/INKLING2.md): thinkingmachines' card and files name no sampling (no
     # generation_config.json), so plain sampling - temperature 1.0, top_p 1.0; "auto" its template's own effort (0.9)
     "ik2": ({"temperature": 1.0, "top_p": 1.0}, "auto"),
-    # Inkling-2-Mini (the setup's Inkling 2, an experimental preview; model_key "ik2-mini"), its author's values (PR
+    # Inkling-2-Mini (the setup's Inkling 2, an experimental preview; model_key "ik2-mini"), its author's sampling (PR
     # #1095): thinkingmachines/Inkling-2-Mini's generation_config.json - temperature 1.0, top_p 1.0, no top-k, no
-    # penalties; the level its template's own default, 0.9 - "high" by name (the page offers none / low / medium /
-    # high / max: its xhigh is max's 0.99, and the server reads a client's "minimal" as off, as for every model)
-    "ik2-mini": ({"temperature": 1.0, "top_p": 1.0}, "high"),
+    # penalties.  The thinking level is Maya's own default, "low" (0.2; the owner, 2026-11-24: shorter thinking and
+    # faster answers - the model's card defaults to 0.9, "high").  The page offers none / low / medium / high / max:
+    # its xhigh is max's 0.99, and the server reads a client's "minimal" as off, as for every model
+    "ik2-mini": ({"temperature": 1.0, "top_p": 1.0}, "low"),
     # GLM-5.3 (744B, glm-dsa: model_key "glm53", serve/glm_dsa_product.py): zai-org/GLM-5.3's
     # generation_config.json and card - temperature 1.0, top_p 0.95 (no top-k, min-p or penalties); reasoning_effort
     # low / high / max, max its default.  Its own entry, so that no quant of it takes GLM-5.3-Flash's tuned values

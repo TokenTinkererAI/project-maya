@@ -395,7 +395,8 @@ offload path there yet). Run on a Radeon 8065S (Ubuntu, ROCm 7.1).
 
 **Defaults.** Thinking Machines' `generation_config.json`: temperature 1.0 (no top_p, no top_k: 1.0 and off).
 Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]: `none` 0.0, `minimal` 0.1, `low`
-0.2, `medium` 0.7, `high` 0.9 (the template's default), `xhigh` and `max` 0.99.
+0.2, `medium` 0.7, `high` 0.9 (the template's default), `xhigh` and `max` 0.99.  Maya's setup writes `low` (the
+faster default; the model's card's own is `high`).
 
 **Files** (Apache 2.0, the model and unsloth's GGUF alike):
 
