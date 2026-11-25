@@ -1655,7 +1655,10 @@ class StrataEngine:
         try:
             while True:
                 try:
-                    line = self.lines.get(timeout=10)
+                    # (a short wait, so a client that goes away is noticed and its STOP written within about a second:
+                    #  a long prompt read writes no line of it until it ends, and a 10 s wait made cancel-then-resend
+                    #  look like a hung server.  A quiet tick yields None, the same keep-alive the 10 s wait gave.)
+                    line = self.lines.get(timeout=1.0)
                 except queue.Empty:
                     if lp_wait is not None:
                         t, lp_wait = lp_wait, None
