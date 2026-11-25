@@ -63,3 +63,18 @@ build-vision.bat
 /data/hy4-cpu-lane.txt
 /data/hy4-cpu-lane.txt.new
 /data/vram-room.json
+
+# stray artefacts from mistyped env values / runtime profiles
+/1
+/data/expert-profile-live.bin
+/data/ik2-draft-ids-*.txt
+
+# hill-climb: generated per-position score dumps and profile blobs (records kept)
+/hill-climb/*-ts*.txt
+/hill-climb/top1-*.txt
+/hill-climb/t1fast-*.txt
+/hill-climb/default-*.txt
+/hill-climb/score2048-*.log
+/hill-climb/prof-*.bin
+/hill-climb/1
+/hill-climb/ts-*.txt

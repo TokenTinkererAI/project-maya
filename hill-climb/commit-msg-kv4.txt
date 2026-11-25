@@ -1,0 +1,7 @@
+﻿ik2: 4-bit KV formats (gated), teacher-forced scoring, @file reader hardening
+
+- KV4 (IK2_KV4, K+V 4-bit E2M1+hdamard) and K8V4 (IK2_KV4V, V-side 4-bit) both env-gated default-off; selftests live (codec round trip 0.11x fp8, rows rms 0.0476); per-side storage; KV lending composes with mixed row sizes; K8V4 quality: needle 100 pct identical at 51K depth, KL 0.002-0.007 nats, documented 3.6x prefill / 2x deep-decode cost on 102K docs
+- Six real engine bugs found and fixed along the way: prep_qkv_r_fp8 launch-argument misalignment (kv4 landeding in q_ld's slot - the degenerate-text root cause), forward_prefill_sup routing >64-token prompts through fp8-only block kernels under the 4-bit gates, signed-q vs unsigned-mag quantisation (fabsf), device/host scale-encoder divergence (nearest-search + bit-arithmetic decode), KV4 row-selftest host-pointer fault, missing kv4_pack_subblock call
+- --score teacher-forced scoring mode (per-position full-vocab logprobs + top-32 lines + mean NLL/PPL, IK2_SCORE_OUT; mutually exclusive with --gen; default path untouched)
+- --tokens/--score @file reader: named errors on open/empty, 64 KiB chunked-append read (verified on the 102,020-id file)
+- universal 4-warp tiling default (8-warp falsified on sm_61 and sm_86), IK2_KT_LOG diagnostic

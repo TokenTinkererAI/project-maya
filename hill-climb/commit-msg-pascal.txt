@@ -1,0 +1,21 @@
+ik2: Pascal sm_61 support behind STRATA_IK2_PASCAL (GTX 10xx)
+
+maya-ik2 built and ran on a GTX 1070 (8 GB, 15 SMs, no tensor cores) after
+this option routes the engine's existing shuffle+FMA mma emulation (the one
+the HIP build uses) to the __CUDA_ARCH__ < 700 branch:
+
+- ik2_kernels.cu: the mma884 emulation (an m16n8k16 ask also resolves
+  there), plus the arch filter admits 61 only under the option
+- ik2_off.cu: lane_pause spin (the __nanosleep wait is sm_70+)
+- ik2_main.cu: the device check admits sm_61 under MAYA_IK2_PASCAL
+
+Default OFF: an sm_70+ build is byte-identical (the guard is false, the
+filter inert, admission unreachable). CUDA 13.x cannot target Pascal, so
+the lab built with CUDA 12.8 (nvcc + g++-14, -DCMAKE_CUDA_ARCHITECTURES=61).
+
+Verified on the card: ik2_kernels_test all passed (mma f16/fp8 on the
+emulated path, every block type, window experts); UD-Q3_K_XL @16K ctx,
+fp8 KV, decode 9.9 tok/s off / 18.4 tok/s with the CPU expert lane
+(IK2_CPU_FRAC=0.5 - emulated-mma Pascal is compute-starved, the lane
+carries half the experts), tier 1201/3072 experts (4.6 GiB), 24 h soak-free
+short bench, coherent English throughout.

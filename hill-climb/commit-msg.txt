@@ -1,0 +1,54 @@
+ik2: 8 more expert block types, CPU expert lane, offload deadlock fix
+
+Reads the Inkling-2-Mini GGUFs the engine refused before on an 8 GB
+card on Windows (verified: unsloth UD-Q3_K_XL, UD-Q4_K_XL, UD-Q4_K_M)
+and speeds the offload path up (16.0 -> 30 tok/s decode, UD-Q3_K_XL,
+RTX 3060 Ti, 131K context).
+
+Block types (ik2_kernels.cu, ik2_main.cu, tests):
+- Q5_0, Q3_K, Q4_K, IQ2_XXS, IQ2_XS, IQ4_NL, IQ3_S, IQ2_S added to
+  the expert kernels (ports of the DS4 IQ kernels, Q5_0 written
+  fresh), with the mixed-type dense fallbacks in the fast paths that
+  UD quants need. UD-Q3_K_XL and UD-Q4_K_M now load and run; device
+  decode is bit-exact against the ggml reference (85k values a type,
+  ik2_kernels_test all passed).
+
+Offload-path fix:
+- ExpertCache::init: every pool keeps a floor of 8 slots. A starved
+  pool (Q4_K_XL at 131K: one slot shared by four layers) deadlocked
+  with "expert cache: no slot free" as soon as one visit pinned more
+  slots than the pool had. Q4_K_XL at 131K now runs clean, and the
+  lazy retry got more passes before it dies.
+
+CPU expert lane, offload decode (default off):
+- IK2_CPU_FRAC: a share of each visit's missed experts is computed
+  on the CPU (ggml-cpu's AVX2 dots over pinned host memory) while the
+  GPU fetches the rest over PCIe; an EMA balances the two buses and
+  the split stays deterministic. Off by default: byte-identical
+  greedy output with it unset.
+- IK2_CPU_BENCH: hand-tuned AVX2 rows for the lane's NVFP4 dot.
+  Measured no faster than ggml-cpu's auto-vectorized loop; kept for
+  the bench knob only.
+
+Drafting on the offload path (default off):
+- IK2_DRAFT_OFF: the DSpark drafter runs beside the offload layout.
+  Measured: acceptance 0.30-0.36 at every width (2-7), and drafting
+  loses to plain decode here because verification pays the window's
+  full fetches. Kept default-off for the cards that want to try.
+- The drafter may now be a GGUF: quantized draft tensors stay as
+  blocks on device and draft through the expert row-dot fast paths
+  (dspark Q3_K: 437 MiB resident vs 809 BF16, same acceptance).
+  The .safetensors path is unchanged.
+
+Prefetch experiments (default off, measured negative, kept for
+reference):
+- IK2_DF: next-visit predicted prefetch. Profile top-k precision
+  measured 44.6% - the random baseline against a 49.6% same-layer
+  repeat rate; the stored order carries no signal.
+- IK2_PF_OFF: layer-ahead whole-union prefill prefetch. The staging
+  ring already pipelines a visit's fetches against its expert GEMMs;
+  the added bytes mostly waste, and a bigger ring eats the tier it
+  saves.
+
+Every default-off switch above is byte-identical when unset (40-token
+greedy against the pre-change binary, fc-verified).
