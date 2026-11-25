@@ -7648,12 +7648,16 @@ int main(int argc, char** argv) {
                 if (T_sup > 0 && (n_gpu == 1 || dual()) && (int) (ids.size() - L) > 64 && !g_kv4v) {
                     BigScratch bs;
                     const int T_pass = big_begin(M, g_dev[0].W, dev_cache(0), (int) (ids.size() - L), (int) ids.size(), bs);
-                    for (size_t p0 = L; p0 < ids.size(); p0 += T_pass) {
+                    // (IK2 cancel: a pass is sized to the whole prompt, so a STOP must be seen INSIDE it.  Stepping the
+                    //  pass in sub_chunk pieces costs one relaxed read per <=512 tokens and cuts a cancel's latency from
+                    //  the prompt's whole read (26 s at 28.6k, ~45 s at 131k) to about a sub-chunk (0.2 s))
+                    const int step = std::max(1, std::min(sub_chunk, T_pass));   // (never past the scratch's size)
+                    for (size_t p0 = L; p0 < ids.size(); p0 += step) {
                         if (g_cancel) {   // (a prompt half run: nothing of it is kept)
                             cancelled = true;
                             break;
                         }
-                        const int n = (int) std::min<size_t>(T_pass, ids.size() - p0);
+                        const int n = (int) std::min<size_t>(step, ids.size() - p0);
                         const bool last_c = p0 + n == ids.size();
                         std::vector<float> lo;
                         forward_prefill_sup(M, ids.data() + p0, n, (int) p0, sub_chunk,
