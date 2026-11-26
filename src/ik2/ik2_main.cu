@@ -422,11 +422,11 @@ bool g_flash = true;   // IK2_FLASH=0: the prefill's attention (FP16 KV) through
 //  score's precision changes.  Default 0: the FP32 path's bytes, sizes and kernels are exactly what they were.)
 bool g_scfp16 = false;
 bool g_scfp16_log = false;   // IK2_SCFP16_LOG=1: one line a prompt chunk naming the query tile the score cap buys
-// (IK2_SC512=1: the score buffer's FLOOR doubles, 64 Mi -> 128 Mi elements (256 -> 512 MiB with fp16 scores), so at a
-//  deep context the tile formula's cap doubles too: Tq 56 -> 112 at 100k keys, half the query blocks a pass.  Nothing
-//  else changes - same kernels, same loop, only more slots.  Off: the floor and every byte stay what they were.)
-bool g_sc512 = false;
-size_t g_lg_floor = (size_t) 64 << 20;   // (scores: the score buffer's floor, lg_cap's lower bound)
+// (IK2_SC_MB=<MiB>: the prefill attention's SCORE buffer, sized in MiB - lg_cap counts scores, so the count follows the
+//  element's size (2 B with IK2_SCFP16, 4 B without) and the MiB asked for is the MiB allocated.  lg16 holds the same
+//  tile as fp16 halves and aliases gu32, so it asks for the same again there: the VRAM a size costs is about twice it.
+//  IK2_SC512=1 is the old alias for IK2_SC_MB=512.  Unset: the 64 Mi-element budget and every byte as they were.)
+size_t g_lg_bytes = 0;   // (the score buffer's budget in bytes; 0: the floor this has always been, in fp32 elements)
 int g_n_sm = 0;
 bool g_group = true;   // IK2_GROUP=0: 2 .. 8 tokens' experts a slot at a time, their attention a head at a time
 bool g_group_exp = true, g_group_attn = true;   // (IK2_GROUP=1: the experts grouped only, 2: the attention only)
@@ -1403,8 +1403,13 @@ void route_measure_report() {
 // (the prefill attention's score buffer, in scores: 8 query rows a head at the full context plus a 128-row band of 130.
 //  lg_cap counts SCORES - IK2_SCFP16 stores them as FP16 (2 B) instead of FP32 (4 B), so the same bytes hold twice as
 //  many and the tile formula's cap doubles.)
+// (the score buffer in SCORES: the context's own floor, then the asked bytes - or, unset, the 64 Mi-element budget
+//  (fp16 scores hold two a slot, so that budget is 128 Mi of them))
 static size_t lg_score_cap(const Config& c, int ctx) {
-    return std::max((size_t) 8 * c.H * (size_t) ctx + (size_t) 8 * c.H * 128 * 130, g_lg_floor);
+    const size_t ctx_term = (size_t) 8 * c.H * (size_t) ctx + (size_t) 8 * c.H * 128 * 130;
+    const size_t budget = g_lg_bytes ? g_lg_bytes / (size_t) (g_scfp16 ? 2 : 4)
+                                     : (g_scfp16 ? (size_t) 128 << 20 : (size_t) 64 << 20);
+    return std::max(ctx_term, budget);
 }
 
 struct Work {
@@ -5763,8 +5768,12 @@ int main(int argc, char** argv) {
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
     g_scfp16 = getenv("IK2_SCFP16") && std::atoi(getenv("IK2_SCFP16"));
     g_scfp16_log = getenv("IK2_SCFP16_LOG") != nullptr;
-    g_sc512 = getenv("IK2_SC512") && std::atoi(getenv("IK2_SC512"));
-    if (g_sc512) g_lg_floor = (size_t) 128 << 20;
+    if (const char* mb = getenv("IK2_SC_MB")) {   // (IK2_SC512=1: the same thing at 512 MiB, the old switch)
+        const long v = std::atol(mb);
+        if (v > 0) g_lg_bytes = (size_t) v << 20;
+    } else if (getenv("IK2_SC512") && std::atoi(getenv("IK2_SC512"))) {
+        g_lg_bytes = (size_t) 512 << 20;
+    }
 #ifdef STRATA_USE_HIP
     if (!k::attn_flash_available()) g_flash = false;   // (AMD: the fused prompt attention where its kernel is built)
 #endif
@@ -6538,10 +6547,11 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
     }
     {   // (IK2_SCFP16: what the prefill attention's score buffer holds, and the query tile that buys at the widest context)
-        const size_t sc = lg_score_cap(c, ctx), cap = g_scfp16 ? 2 * sc : sc;
-        std::printf("attention scores: %s%s, %.0f MiB, %zu scores (Tq %zu at --max-context %d)\n",
+        const size_t cap = lg_score_cap(c, ctx), esz = g_scfp16 ? 2 : 4;   // (scores, bytes a score)
+        std::printf("attention scores: %s%s, %.0f MiB lg (%zu scores), %.0f MiB lg16 (Tq %zu at --max-context %d)\n",
                     g_scfp16 ? "FP16 (IK2_SCFP16=1)" : "FP32 (IK2_SCFP16=0)",
-                    g_sc512 ? " + 512 MiB floor (IK2_SC512=1)" : "", (double) (sc * 4) / 1048576.0, cap,
+                    g_lg_bytes ? " + IK2_SC_MB sized" : "", (double) (cap * esz) / 1048576.0, cap,
+                    (double) (cap * 2) / 1048576.0,
                     std::max<size_t>(1, cap / ((size_t) c.H * (size_t) ctx)), ctx);
         std::fflush(stdout);
     }
@@ -6856,8 +6866,7 @@ int main(int argc, char** argv) {
     W.vconv = dalloc<float>(Tm * KD);
     W.rr = dalloc<float>(Tm * c.H * c.d_rel), W.sink = dalloc<float>(Tm * c.H);
     W.dyn = dalloc<float>(2 * Tm * c.KV * 4);   // (a full layer's dynamic taps: k's, and on the resident path v's beside)
-    W.lg_cap = lg_score_cap(c, ctx);   // (scores; IK2_SCFP16: twice as many in the same bytes)
-    if (g_scfp16) W.lg_cap *= 2;
+    W.lg_cap = lg_score_cap(c, ctx);   // (scores; the byte size is lg_cap * the element's - lg_cap follows it)
     W.lg = dalloc<float>(g_scfp16 ? W.lg_cap / 2 : W.lg_cap);
     W.blocks = dalloc<float>((size_t) (c.n_layer / c.block + 1) * T_buf * C);
     W.x16 = dalloc<uint16_t>(Tm * std::max(C, HD)), W.xk16 = dalloc<uint16_t>(Tm * C), W.xv16 = dalloc<uint16_t>(Tm * C);
