@@ -1850,6 +1850,160 @@ __device__ __forceinline__ void e4m3x4_h4_s8(uint32_t w, uint32_t& lo, uint32_t&
     hi = (t1 & 0x80008000u) | ((t1 >> 1) & 0x3F803F80u);
 }
 
+// ---- A2 (IK2_AT2=1): one token's attention as plain warp dots, without the m16n8k16 emulation --------------------
+// The emulated m16n8k16 (the only path Pascal has) gives its 8 columns to query heads, and this model has R = 3 of
+// them a K / V head: 5 columns in 8 are waste, and the emulation forms every product with a shuffle and an FP16 ->
+// FP32 convert - 251 instructions a key a lane.  Here a key's R logits and its R * 128 output terms are simply dots:
+//   16 lanes a key, 8 of the head's 128 dims a lane, so the K and V rows are read once (a uint2 a lane), converted
+//   once (2 e4m3x4_h4 a lane) and used by all R heads; a 4-step shuffle tree reduces the R partials over the key's
+//   lanes, and the relative bias's element rides that same tree (d_rel = 16: a lane its own element), so it costs
+//   three FMAs a key.  A warp is two keys a step - its two halves keep their own (max, sum) and output and merge
+//   once at the end.  The accumulation is FP32 over the same FP8 (or FP16) values the emulation multiplied: the
+//   same logits and the same output, up to the order of the sums.  ~80 instructions a key a lane.
+constexpr int kAt2Lanes = 16;               // the lanes of one key
+constexpr int kAt2Dims = kFaD / kAt2Lanes;  // 8 dims a lane
+constexpr int kAt2DRel = 16;                // (relative_length: a lane of the key its own element)
+
+template <class KVT, int R>
+__global__ void __launch_bounds__(kWaNW * 32, 4)
+attn_decode_at2_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc, const KVT* __restrict__ vc,
+                       int kv_cap, int H, int Hkv, const int* pos_d, int qpos, float qk_scale,
+                       const float* __restrict__ r, const float* __restrict__ proj, int extent, int window,
+                       int n_split, float* __restrict__ o_part, float2* __restrict__ ml_part) {
+    constexpr bool F8 = sizeof(KVT) == 1;
+    if (pos_d) qpos = *pos_d;   // (a token of a replayed graph: its position read here)
+    const int lane = threadIdx.x & 31, kb = lane >> 4, e = lane & (kAt2Lanes - 1);   // (the pair's key, the dims 8 e..)
+    const int g = blockIdx.x, w = blockIdx.y * kWaNW + (threadIdx.x >> 5);
+    const int KD = Hkv * kFaD;
+    int k_lo, n_steps;
+    const int n_act = wa_active(qpos, window, n_split * kWaNW, k_lo, n_steps);
+    if (w >= n_act) return;
+    const int nk = qpos + 1 - k_lo;                          // the token's keys
+    const int per = nk / n_act, rem = nk % n_act;            // (the n_act warps share them; each has one)
+    const int ka = w * per + min(w, rem), kend = ka + per + (w < rem ? 1 : 0);
+    const float sc = qk_scale * kLog2e;
+    const float rb_scale = 1.0f / qk_scale;   // (the bias joins the dot before its scale: its units are log2)
+    float qh[R][kAt2Dims], rh[R];
+#pragma unroll
+    for (int h = 0; h < R; ++h) {
+        const __half* qr = (const __half*) (q16 + (size_t) (g * R + h) * kFaD + e * kAt2Dims);
+#pragma unroll
+        for (int d = 0; d < kAt2Dims; ++d) qh[h][d] = __half2float(qr[d]);
+        rh[h] = __ldg(r + (size_t) (g * R + h) * kAt2DRel + e) * rb_scale;
+    }
+    float o[R][kAt2Dims];
+#pragma unroll
+    for (int h = 0; h < R; ++h)
+#pragma unroll
+        for (int d = 0; d < kAt2Dims; ++d) o[h][d] = 0.0f;
+    float m[R], l[R];
+#pragma unroll
+    for (int h = 0; h < R; ++h) m[h] = -INFINITY, l[h] = 0.0f;
+    const int row0 = kv_cap > 0 ? k_lo % kv_cap : 0;   // (one modulo a warp, as the steps' rows were)
+    const KVT* kg = kc + (size_t) g * kFaD + e * kAt2Dims;
+    const KVT* vg = vc + (size_t) g * kFaD + e * kAt2Dims;
+    // a lane's 8 values of a row (K's or V's): FP8 as its FP16 (the emulation's own e4m3x4_h4), or the FP16 cache
+    auto ld8 = [&](const KVT* p, float* f) {
+        if constexpr (F8) {
+            const uint2 x = __ldg((const uint2*) p);
+            uint32_t a0, a1, a2, a3;
+            e4m3x4_h4(x.x, a0, a1);
+            e4m3x4_h4(x.y, a2, a3);
+            const float2 f0 = u32_to_f2(a0), f1 = u32_to_f2(a1), f2 = u32_to_f2(a2), f3 = u32_to_f2(a3);
+            f[0] = f0.x, f[1] = f0.y, f[2] = f1.x, f[3] = f1.y;
+            f[4] = f2.x, f[5] = f2.y, f[6] = f3.x, f[7] = f3.y;
+        } else {
+            const uint4 x = __ldg((const uint4*) p);
+            const float2 f0 = u32_to_f2(x.x), f1 = u32_to_f2(x.y), f2 = u32_to_f2(x.z), f3 = u32_to_f2(x.w);
+            f[0] = f0.x, f[1] = f0.y, f[2] = f1.x, f[3] = f1.y;
+            f[4] = f2.x, f[5] = f2.y, f[6] = f3.x, f[7] = f3.y;
+        }
+    };
+    for (int k0 = ka; k0 < kend; k0 += 2) {
+        const int key = k0 + kb, kq = min(key, qpos);
+        int rw = kv_cap > 0 ? row0 + (kq - k_lo) : kq;
+        if (kv_cap > 0 && rw >= kv_cap) rw -= kv_cap;
+        const size_t off = (size_t) rw * KD;
+        // the bias's lane: proj[qpos - key] . r[h] (zero past the extent)
+        const int dist = qpos - key;
+        const bool inb = dist >= 0 && dist < extent;
+        const float pj = __ldg(proj + (size_t) (inb ? dist : 0) * kAt2DRel + e);
+        float c[R];
+#pragma unroll
+        for (int h = 0; h < R; ++h) c[h] = inb ? pj * rh[h] : 0.0f;
+        // Q K^T: the lane's 8 dims of its key, for every head
+        float kf[kAt2Dims];
+        ld8(kg + off, kf);
+#pragma unroll
+        for (int h = 0; h < R; ++h)
+#pragma unroll
+            for (int d = 0; d < kAt2Dims; ++d) c[h] = fmaf(qh[h][d], kf[d], c[h]);
+#pragma unroll
+        for (int h = 0; h < R; ++h)
+#pragma unroll
+            for (int sh = kAt2Lanes / 2; sh >= 1; sh >>= 1) c[h] += __shfl_xor_sync(0xFFFFFFFFu, c[h], sh);
+        // the logits (log2 units): the scale, the mask (a key past the token or past this warp's run)
+        const bool ok = key < kend && key <= qpos;
+#pragma unroll
+        for (int h = 0; h < R; ++h) c[h] = ok ? c[h] * sc : -INFINITY;
+        // the online softmax: a new maximum rescales this lane's 8 output dims of those heads
+        bool need = false;
+#pragma unroll
+        for (int h = 0; h < R; ++h) need |= c[h] > m[h];
+        if (__any_sync(0xFFFFFFFFu, need)) {
+#pragma unroll
+            for (int h = 0; h < R; ++h) {
+                if (c[h] > m[h]) {
+                    const float f = m[h] == -INFINITY ? 0.0f : exp2f(m[h] - c[h]);
+                    l[h] *= f;
+#pragma unroll
+                    for (int d = 0; d < kAt2Dims; ++d) o[h][d] *= f;
+                    m[h] = c[h];
+                }
+            }
+        }
+        float p[R];
+#pragma unroll
+        for (int h = 0; h < R; ++h) {
+            const float u = m[h] == -INFINITY ? 0.0f : m[h];
+            p[h] = exp2f(c[h] - u);
+            l[h] += p[h];
+        }
+        // P V: this lane's 8 dims of its key's V row, for every head
+        float vf[kAt2Dims];
+        ld8(vg + off, vf);
+#pragma unroll
+        for (int h = 0; h < R; ++h)
+#pragma unroll
+            for (int d = 0; d < kAt2Dims; ++d) o[h][d] = fmaf(p[h], vf[d], o[h][d]);
+    }
+    // the warp's two key groups merge: their (max, sum) and their output
+#pragma unroll
+    for (int h = 0; h < R; ++h) {
+        const float m1 = __shfl_xor_sync(0xFFFFFFFFu, m[h], kAt2Lanes);
+        const float l1 = __shfl_xor_sync(0xFFFFFFFFu, l[h], kAt2Lanes);
+        const float mm = fmaxf(m[h], m1);
+        const float f0 = mm == -INFINITY ? 0.0f : exp2f(m[h] - mm);
+        const float f1 = mm == -INFINITY ? 0.0f : exp2f(m1 - mm);
+        l[h] = l[h] * f0 + l1 * f1;
+        m[h] = mm;
+#pragma unroll
+        for (int d = 0; d < kAt2Dims; ++d) {
+            const float o1 = __shfl_xor_sync(0xFFFFFFFFu, o[h][d], kAt2Lanes);
+            o[h][d] = o[h][d] * f0 + o1 * f1;
+        }
+    }
+    if (kb != 0) return;
+    // this warp's partials: o_part [warp][H][D], ml_part [warp][H] = (max in log2 units, sum)
+#pragma unroll
+    for (int h = 0; h < R; ++h) {
+        float* op = o_part + ((size_t) w * H + g * R + h) * kFaD + e * kAt2Dims;
+        *(float4*) op = make_float4(o[h][0], o[h][1], o[h][2], o[h][3]);
+        *(float4*) (op + 4) = make_float4(o[h][4], o[h][5], o[h][6], o[h][7]);
+        if (e == 0) ml_part[(size_t) w * H + g * R + h] = make_float2(m[h], l[h]);
+    }
+}
+
 // ---- Volta (sm_70): one token's attention on mma.m8n8k4 - attn_decode_mma_kernel's job, its partials and its combine.
 // A warp takes 32 keys a step, a quad pair (mma884) 8 of them:
 //   Q K^T  C [8 keys][8 heads] += A [8 keys][4 dims] B [4 dims][8 heads]: A a lane's key row straight from the cache,
@@ -7894,7 +8048,33 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
     float* o_part = scratch;
     float2* ml_part = (float2*) (o_part + (size_t) n_split * kWaNW * H * kFaD);
     const bool rel4 = d_rel % 4 == 0 && (((uintptr_t) r | (uintptr_t) proj) & 15) == 0;
-    if (arch_class() == 70)   // (Volta: mma.m8n8k4, the same partials)
+    // (IK2_AT2=1: the plain warp-dot kernel, for the geometries it is written for - D 128, d_rel 16, R <= 4.  It is
+    //  FFMA and shuffles, so the arch does not matter, and it writes the m16n8k16 kernel's partials, whose combine
+    //  merges them.  Else, and by default, the emulated mma - attn_decode_v70_kernel on Volta and older.)
+    static const bool at2 = getenv("IK2_AT2") && std::atoi(getenv("IK2_AT2")) != 0;
+    const int R = H / Hkv;
+    const bool at2_ok = at2 && R >= 1 && R <= 4 && d_rel == kAt2DRel;
+    const dim3 grid_at2((unsigned) Hkv, (unsigned) n_split);
+    if (at2_ok) {
+        switch (R) {
+            case 1:
+                attn_decode_at2_kernel<KV, 1><<<grid_at2, kWaNW * 32, 0, s>>>(
+                    q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, extent, window, n_split, o_part, ml_part);
+                break;
+            case 2:
+                attn_decode_at2_kernel<KV, 2><<<grid_at2, kWaNW * 32, 0, s>>>(
+                    q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, extent, window, n_split, o_part, ml_part);
+                break;
+            case 3:
+                attn_decode_at2_kernel<KV, 3><<<grid_at2, kWaNW * 32, 0, s>>>(
+                    q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, extent, window, n_split, o_part, ml_part);
+                break;
+            default:
+                attn_decode_at2_kernel<KV, 4><<<grid_at2, kWaNW * 32, 0, s>>>(
+                    q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, extent, window, n_split, o_part, ml_part);
+                break;
+        }
+    } else if (arch_class() == 70)   // (Volta and older: mma.m8n8k4, the same partials)
         attn_decode_v70_kernel<KV><<<dim3((unsigned) Hkv, (unsigned) n_split), kWaNW * 32, 0, s>>>(
             q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4, extent, window, n_split, o_part,
             ml_part);
@@ -7903,7 +8083,10 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
         q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4, extent, window, n_split, o_part,
         ml_part);
     check("attn_decode_mma");
-    if (arch_class() == 70)
+    if (at2_ok)   // (the warp-dot kernel keeps V in its true units - no 2^-8 to undo, so no 256)
+        attn_decode_mma_combine_kernel<<<(unsigned) H, kFaD, (size_t) (kFaD + n_split * kWaNW) * sizeof(float), s>>>(
+            o_part, ml_part, n_split, H, sink, v_inv, pos, qpos, window, gate, out, out16);
+    else if (arch_class() == 70)
         attn_decode_v70_combine_kernel<<<(unsigned) H, kFaD, (size_t) (kFaD + n_split * kWaNW) * sizeof(float), s>>>(
             o_part, ml_part, n_split, H, sink, v_inv * (sizeof(KV) == 1 ? 256.0f : 1.0f), pos, qpos, window, gate, out,
             out16);   // (FP8: its V as FP16 times 2^-8)
