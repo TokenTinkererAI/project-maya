@@ -85,6 +85,13 @@ void attn_probs_bias_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk
 void attn_probs_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk, int qpos0, int kpos0, float qk_scale,
                     const float* r, int d_rel, const float* proj, int extent, int window, const float* sink,
                     cudaStream_t s);
+/// The same two over FP16 scores (IK2_SCFP16: half the bytes a score, so twice the queries a tile).
+void attn_probs_bias_f16_h(const uint16_t* lg, uint16_t* out16, int H, int Tq, int nk, int qpos0, int kpos0,
+                           float qk_scale, const float* bias, int extent, int window, const float* sink,
+                           cudaStream_t s);
+void attn_probs_f16_h(const uint16_t* lg, uint16_t* out16, int H, int Tq, int nk, int qpos0, int kpos0,
+                      float qk_scale, const float* r, int d_rel, const float* proj, int extent, int window,
+                      const float* sink, cudaStream_t s);
 /// Prefill attention fused (FP16 KV, D = 128): q16 [Tq] rows of q_ld (head h at h * D) at positions qpos0 ..;
 /// kc / vc the cache [pos or pos % kv_cap][KV * D]; keys [max(0, qp - window + 1), qp] of each query; the relative
 /// bias from the table bias [Tq * H][extent] (as attn_probs_bias_f16), sink [Tq][H] -> out [Tq] rows of o_ld (F32).

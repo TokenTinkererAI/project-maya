@@ -416,6 +416,12 @@ inline bool dual() { return g_ep || g_tp; }
 std::vector<uint8_t> g_ep_own;
 inline int ep_owner(int l, int e) { return g_ep_own[(size_t) l * g_pop_E_ep + e]; }
 bool g_flash = true;   // IK2_FLASH=0: the prefill's attention (FP16 KV) through the logits in memory and cuBLAS, not fused
+// (IK2_SCFP16=1: the prefill attention's QK scores are stored FP16 instead of FP32.  The same buffer then holds twice as
+//  many, so the query tile the softmax / GEMM loop takes (Tq) doubles - the QK and PV products run a fuller cuBLAS tile
+//  and every touch of a score moves 2 bytes instead of 4.  The softmax still accumulates in FP32: only the stored
+//  score's precision changes.  Default 0: the FP32 path's bytes, sizes and kernels are exactly what they were.)
+bool g_scfp16 = false;
+bool g_scfp16_log = false;   // IK2_SCFP16_LOG=1: one line a prompt chunk naming the query tile the score cap buys
 int g_n_sm = 0;
 bool g_group = true;   // IK2_GROUP=0: 2 .. 8 tokens' experts a slot at a time, their attention a head at a time
 bool g_group_exp = true, g_group_attn = true;   // (IK2_GROUP=1: the experts grouped only, 2: the attention only)
@@ -1389,6 +1395,13 @@ void route_measure_report() {
 
 // ---- the forward
 
+// (the prefill attention's score buffer, in scores: 8 query rows a head at the full context plus a 128-row band of 130.
+//  lg_cap counts SCORES - IK2_SCFP16 stores them as FP16 (2 B) instead of FP32 (4 B), so the same bytes hold twice as
+//  many and the tile formula's cap doubles.)
+static size_t lg_score_cap(const Config& c, int ctx) {
+    return std::max((size_t) 8 * c.H * (size_t) ctx + (size_t) 8 * c.H * 128 * 130, (size_t) 64 << 20);
+}
+
 struct Work {
     static constexpr int kPackRing = 4;
     static constexpr int kMissBatch = 24;
@@ -1941,6 +1954,12 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         k::to_f16(q_p, (size_t) T * HD, W.x16, g_s);
         uint16_t* lg16 = W.lg16;
         const int GQA = c.H / c.KV;
+        // (IK2_SCFP16: the QK GEMM leaves its scores FP16 - the same buffer, twice the rows - and the softmax reads them
+        //  back as FP16, summing in FP32.  Off: the FP32 call it always was.)
+        const cudaDataType_t sc_type = g_scfp16 ? CUDA_R_16F : CUDA_R_32F;
+        auto sc_ptr = [&](long long off) -> void* {
+            return g_scfp16 ? (void*) ((uint16_t*) W.lg + off) : (void*) (W.lg + off);
+        };
         // softmax rows (with the relative bias and the sink) -> lg16: the bias as one small GEMM (K = d_rel) first
         auto attn_probs = [&](int Tq, int nk_s, int ts, int k0_s) {
             if (W.relb && extent <= W.relb_ext) {
@@ -1948,11 +1967,20 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                 CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, extent, Tq * c.H, c.d_rel, &one_f, Ly.rel_proj,
                                 CUDA_R_32F, c.d_rel, r_p + (size_t) ts * HR, CUDA_R_32F, c.d_rel, &zero_f, W.relb,
                                 CUDA_R_32F, extent, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
-                k::attn_probs_bias_f16(W.lg, lg16, c.H, Tq, nk_s, pos0 + ts, k0_s, qk_scale, W.relb, extent, window,
-                                       sink_p + (size_t) ts * c.H, g_s);
+                if (g_scfp16)
+                    k::attn_probs_bias_f16_h((const uint16_t*) W.lg, lg16, c.H, Tq, nk_s, pos0 + ts, k0_s, qk_scale,
+                                             W.relb, extent, window, sink_p + (size_t) ts * c.H, g_s);
+                else
+                    k::attn_probs_bias_f16(W.lg, lg16, c.H, Tq, nk_s, pos0 + ts, k0_s, qk_scale, W.relb, extent, window,
+                                           sink_p + (size_t) ts * c.H, g_s);
             } else {
-                k::attn_probs_f16(W.lg, lg16, c.H, Tq, nk_s, pos0 + ts, k0_s, qk_scale, r_p + (size_t) ts * HR,
-                                  c.d_rel, Ly.rel_proj, extent, window, sink_p + (size_t) ts * c.H, g_s);
+                if (g_scfp16)
+                    k::attn_probs_f16_h((const uint16_t*) W.lg, lg16, c.H, Tq, nk_s, pos0 + ts, k0_s, qk_scale,
+                                        r_p + (size_t) ts * HR, c.d_rel, Ly.rel_proj, extent, window,
+                                        sink_p + (size_t) ts * c.H, g_s);
+                else
+                    k::attn_probs_f16(W.lg, lg16, c.H, Tq, nk_s, pos0 + ts, k0_s, qk_scale, r_p + (size_t) ts * HR,
+                                      c.d_rel, Ly.rel_proj, extent, window, sink_p + (size_t) ts * c.H, g_s);
             }
         };
         if (g_flash && !g_kv4v && c.D == 128 && W.relb && extent <= W.relb_ext) {   // (IK2_KV4: the chunked path)
@@ -1970,11 +1998,12 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                 if (g_kv_fp8)
                     k::attn_flash_fp8(W.x16 + (size_t) ts * HD, HD, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, Tq,
                                       pos0 + ts, qk_scale * k_inv, v_inv, W.relb, extent, window,
-                                      sink_p + (size_t) ts * c.H, W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
+                                      sink_p + (size_t) ts * c.H, W.o + (size_t) ts * HD, HD, W.lg,
+                                      g_scfp16 ? W.lg_cap / 2 : W.lg_cap, ns, g_s);
                 else
                     k::attn_flash_f16(W.x16 + (size_t) ts * HD, HD, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, Tq,
                                       pos0 + ts, qk_scale, W.relb, extent, window, sink_p + (size_t) ts * c.H,
-                                      W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
+                                      W.o + (size_t) ts * HD, HD, W.lg, g_scfp16 ? W.lg_cap / 2 : W.lg_cap, ns, g_s);
             }
         } else
         for (int ts = 0; ts < T;) {
@@ -1983,6 +2012,9 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             int Tq = std::max(1, std::min(T - ts, (int) (W.lg_cap / ((size_t) c.H * nk_ub))));
             if (W.relb) Tq = std::min(Tq, Work::kRelbRows);
             const int nk_s = pos0 + ts + Tq - k0_s;
+            if (g_scfp16_log && !Ly.sliding && ts == 0)
+                std::printf("attn tile: T %d at %d, nk_ub %d -> Tq %d (%d a chunk of this pass)\n", T, pos0, nk_ub, Tq,
+                            (T + Tq - 1) / Tq);
             const long long qn = (long long) Tq * nk_s;
             if (g_kv_fp8) {
                 // (IK2_KV4: the same windows, read 4-bit - the packed row's blocks decode straight into the f16 window, so
@@ -2004,7 +2036,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                         CB(cublasGemmStridedBatchedEx(
                             g_blas, CUBLAS_OP_T, CUBLAS_OP_N, nk_c, Tq, c.D, &one, Kp, CUDA_R_16F, KD, 0,
                             W.x16 + (size_t) ts * HD + (size_t) g * GQA * c.D, CUDA_R_16F, HD, (long long) c.D, &zero,
-                            W.lg + (size_t) g * GQA * qn + k_off, CUDA_R_32F, nk_s, qn, GQA, CUBLAS_COMPUTE_32F,
+                            sc_ptr((long long) g * GQA * qn + k_off), sc_type, nk_s, qn, GQA, CUBLAS_COMPUTE_32F,
                             CUBLAS_GEMM_DEFAULT));
                     }
                 }
@@ -2033,14 +2065,14 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                     CB(cublasGemmStridedBatchedEx(
                         g_blas, CUBLAS_OP_T, CUBLAS_OP_N, n1, Tq, c.D, &one, Kp1, CUDA_R_16F, KD, 0,
                         W.x16 + (size_t) ts * HD + (size_t) g * GQA * c.D, CUDA_R_16F, HD, (long long) c.D, &zero,
-                        W.lg + (size_t) g * GQA * qn, CUDA_R_32F, nk_s, qn, GQA, CUBLAS_COMPUTE_32F,
+                        sc_ptr((long long) g * GQA * qn), sc_type, nk_s, qn, GQA, CUBLAS_COMPUTE_32F,
                         CUBLAS_GEMM_DEFAULT));
                     if (n2 > 0) {
                         const uint16_t* Kp2 = Ly.kc + (size_t) g * c.D;
                         CB(cublasGemmStridedBatchedEx(
                             g_blas, CUBLAS_OP_T, CUBLAS_OP_N, n2, Tq, c.D, &one, Kp2, CUDA_R_16F, KD, 0,
                             W.x16 + (size_t) ts * HD + (size_t) g * GQA * c.D, CUDA_R_16F, HD, (long long) c.D, &zero,
-                            W.lg + (size_t) g * GQA * qn + n1, CUDA_R_32F, nk_s, qn, GQA, CUBLAS_COMPUTE_32F,
+                            sc_ptr((long long) g * GQA * qn + n1), sc_type, nk_s, qn, GQA, CUBLAS_COMPUTE_32F,
                             CUBLAS_GEMM_DEFAULT));
                     }
                 }
@@ -5110,7 +5142,9 @@ size_t big_carve(const Config& c, int T, size_t gu32_have, size_t lg_want, size_
 int big_begin(const Model& M, Work& W, ExpertCache& EC, int n, int ctx_end, BigScratch& bs) {
     bs.pool = -1;
     // (the offload path lends none of the tier: what a prompt took would be gone from it for the decode)
-    if (W.T_sup <= 0 || dual() || (g_off && EC.tier_only) || (getenv("IK2_BORROW") && !std::atoi(getenv("IK2_BORROW"))))
+    // (IK2_SCFP16: the lent scratch's attention buffers are carved in FP32 elements - the two are not composed)
+    if (W.T_sup <= 0 || dual() || (g_off && EC.tier_only) || g_scfp16 ||
+        (getenv("IK2_BORROW") && !std::atoi(getenv("IK2_BORROW"))))
         return W.T_sup;
     const Config& c = M.c;
     // the attention's scratch for 256 queries against the whole context: few, large GEMMs (the default ~400 MB left
@@ -5722,6 +5756,8 @@ int main(int argc, char** argv) {
     g_lookup = drafting != "off" && !(getenv("IK2_LOOKUP") && !std::atoi(getenv("IK2_LOOKUP")));
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
+    g_scfp16 = getenv("IK2_SCFP16") && std::atoi(getenv("IK2_SCFP16"));
+    g_scfp16_log = getenv("IK2_SCFP16_LOG") != nullptr;
 #ifdef STRATA_USE_HIP
     if (!k::attn_flash_available()) g_flash = false;   // (AMD: the fused prompt attention where its kernel is built)
 #endif
@@ -6494,6 +6530,13 @@ int main(int argc, char** argv) {
                     kv_bytes / 1073741824.0, c.n_visit, c.n_pass > 1 ? " visits" : "s");
         std::fflush(stdout);
     }
+    {   // (IK2_SCFP16: what the prefill attention's score buffer holds, and the query tile that buys at the widest context)
+        const size_t sc = lg_score_cap(c, ctx), cap = g_scfp16 ? 2 * sc : sc;
+        std::printf("attention scores: %s, %.0f MiB, %zu scores (Tq %zu at --max-context %d)\n",
+                    g_scfp16 ? "FP16 (IK2_SCFP16=1)" : "FP32 (IK2_SCFP16=0)", (double) (sc * 4) / 1048576.0, cap,
+                    std::max<size_t>(1, cap / ((size_t) c.H * (size_t) ctx)), ctx);
+        std::fflush(stdout);
+    }
     size_t fr = 0, tot = 0;
     for (int d = 0; d < n_gpu; ++d) {
         use_dev(d);
@@ -6805,8 +6848,9 @@ int main(int argc, char** argv) {
     W.vconv = dalloc<float>(Tm * KD);
     W.rr = dalloc<float>(Tm * c.H * c.d_rel), W.sink = dalloc<float>(Tm * c.H);
     W.dyn = dalloc<float>(2 * Tm * c.KV * 4);   // (a full layer's dynamic taps: k's, and on the resident path v's beside)
-    W.lg_cap = std::max((size_t) 8 * c.H * (size_t) ctx + (size_t) 8 * c.H * 128 * 130, (size_t) 64 << 20);
-    W.lg = dalloc<float>(W.lg_cap);
+    W.lg_cap = lg_score_cap(c, ctx);   // (scores; IK2_SCFP16: twice as many in the same bytes)
+    if (g_scfp16) W.lg_cap *= 2;
+    W.lg = dalloc<float>(g_scfp16 ? W.lg_cap / 2 : W.lg_cap);
     W.blocks = dalloc<float>((size_t) (c.n_layer / c.block + 1) * T_buf * C);
     W.x16 = dalloc<uint16_t>(Tm * std::max(C, HD)), W.xk16 = dalloc<uint16_t>(Tm * C), W.xv16 = dalloc<uint16_t>(Tm * C);
     if (W.T_sup > 0 || dual()) W.xq16_sup = dalloc<uint16_t>(T_buf * C);

@@ -373,6 +373,35 @@ void test_attn_probs() {
         for (size_t i = 0; i < raw2.size(); ++i) got[i] = h2f_host(raw2[i]);
         std::snprintf(nm, sizeof nm, "%s (f16, bias table)", c.name);
         expect(nm, got, want, 2e-3, 1e-4);
+        // (IK2_SCFP16: the fp16-score kernels are the fp32 ones over the same scores, rounded - the softmax's arithmetic
+        //  is fp32 in both, so over those exact values the fp16 output has to match the fp32 kernel's bit for bit)
+        {
+            const size_t n = (size_t) H * c.Tq * c.nk;
+            std::vector<uint16_t> sc16(n);
+            std::vector<float> rounded(n);
+            for (size_t i = 0; i < n; ++i) sc16[i] = f2h_host(lg[i]), rounded[i] = h2f_host(sc16[i]);
+            float* dlr = dev(rounded);
+            uint16_t* dh = dev_n<uint16_t>(n);
+            cudaMemcpy(dh, sc16.data(), n * 2, cudaMemcpyHostToDevice);
+            std::vector<float> ref(n), have(n);
+            k::attn_probs_bias_f16(dlr, dout, H, c.Tq, c.nk, c.qpos0, c.kpos0, scale, dbt, c.extent, c.window, dsk, 0);
+            auto rawa = host(dout, n);
+            for (size_t i = 0; i < n; ++i) ref[i] = h2f_host(rawa[i]);
+            k::attn_probs_bias_f16_h(dh, dout, H, c.Tq, c.nk, c.qpos0, c.kpos0, scale, dbt, c.extent, c.window, dsk, 0);
+            const auto rawh = host(dout, n);
+            for (size_t i = 0; i < n; ++i) have[i] = h2f_host(rawh[i]);
+            std::snprintf(nm, sizeof nm, "%s (f16 scores vs the fp32 kernel over them)", c.name);
+            expect(nm, have, std::vector<double>(ref.begin(), ref.end()), 0.0, 0.0);
+            k::attn_probs_f16(dlr, dout, H, c.Tq, c.nk, c.qpos0, c.kpos0, scale, dr, d_rel, dp, c.extent, c.window, dsk, 0);
+            rawa = host(dout, n);
+            for (size_t i = 0; i < n; ++i) ref[i] = h2f_host(rawa[i]);
+            k::attn_probs_f16_h(dh, dout, H, c.Tq, c.nk, c.qpos0, c.kpos0, scale, dr, d_rel, dp, c.extent, c.window, dsk, 0);
+            const auto rawh2 = host(dout, n);
+            for (size_t i = 0; i < n; ++i) have[i] = h2f_host(rawh2[i]);
+            std::snprintf(nm, sizeof nm, "%s (f16 scores, dot-product bias)", c.name);
+            expect(nm, have, std::vector<double>(ref.begin(), ref.end()), 0.0, 0.0);
+            cudaFree(dlr), cudaFree(dh);
+        }
         cudaFree(dl), cudaFree(dr), cudaFree(dp), cudaFree(dsk), cudaFree(dout), cudaFree(dbt);
     }
 }

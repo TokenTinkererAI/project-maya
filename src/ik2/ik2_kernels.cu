@@ -838,13 +838,19 @@ __global__ void attn_probs_kernel(float* lg, int nk, int qpos0, int kpos0, float
     for (int j = threadIdx.x; j < nk; j += kBlk) row[j] *= inv;
 }
 
-__global__ void attn_probs_f16_kernel(const float* lg, uint16_t* out16, int H, int Tq, int nk, int qpos0, int kpos0,
+// (IK2_SCFP16: the stored score - FP32 as it always was, or FP16 when the buffer is halved.  The kernels' own arithmetic
+//  is FP32 either way: the load is the only thing that knows.)
+__device__ __forceinline__ float sc_load(const float* p) { return __ldg(p); }
+__device__ __forceinline__ float sc_load(const uint16_t* p) { return h2f(__ldg(p)); }
+
+template <class SC>
+__global__ void attn_probs_f16_kernel(const SC* lg, uint16_t* out16, int H, int Tq, int nk, int qpos0, int kpos0,
                                       float qk_scale, const float* r, int d_rel, const float* proj, int extent,
                                       int window, const float* sink) {
     __shared__ float sh[kBlk];
     __shared__ float rs[64];
     const int i = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
-    const float* row = lg + ((size_t) h * Tq + i) * nk;
+    const SC* row = lg + ((size_t) h * Tq + i) * nk;
     uint16_t* row_out = out16 + ((size_t) h * Tq + i) * nk;
     const float* ri_g = r + ((size_t) i * H + h) * d_rel;
     if (d_rel <= 64) {
@@ -857,7 +863,7 @@ __global__ void attn_probs_f16_kernel(const float* lg, uint16_t* out16, int H, i
     float mx = -INFINITY, sum = 0.0f;
     for (int j = j_lo + tid; j < j_hi; j += kBlk) {
         const int dist = qp - (kpos0 + j);
-        float l = __ldg(row + j) * qk_scale;
+        float l = sc_load(row + j) * qk_scale;
         if (dist < extent) {
             const float* p = proj + (size_t) dist * d_rel;
             float b = 0.0f;
@@ -878,7 +884,7 @@ __global__ void attn_probs_f16_kernel(const float* lg, uint16_t* out16, int H, i
     for (int j = tid; j < j_lo; j += kBlk) row_out[j] = 0;
     for (int j = j_lo + tid; j < j_hi; j += kBlk) {
         const int dist = qp - (kpos0 + j);
-        float l = __ldg(row + j) * qk_scale;
+        float l = sc_load(row + j) * qk_scale;
         if (dist < extent) {
             const float* p = proj + (size_t) dist * d_rel;
             float b = 0.0f;
@@ -892,12 +898,13 @@ __global__ void attn_probs_f16_kernel(const float* lg, uint16_t* out16, int H, i
 
 // attn_probs_f16 with the relative bias already in a table: bias [Tq * H rows][extent] (row i * H + h, column the
 // distance), so an element costs a load instead of a d_rel-long dot product (done twice) - the prefill's hot kernel.
-__global__ void attn_probs_bias_f16_kernel(const float* lg, uint16_t* out16, int H, int Tq, int nk, int qpos0,
+template <class SC>
+__global__ void attn_probs_bias_f16_kernel(const SC* lg, uint16_t* out16, int H, int Tq, int nk, int qpos0,
                                            int kpos0, float qk_scale, const float* bias, int extent, int window,
                                            const float* sink) {
     __shared__ float sh[kBlk];
     const int i = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
-    const float* row = lg + ((size_t) h * Tq + i) * nk;
+    const SC* row = lg + ((size_t) h * Tq + i) * nk;
     uint16_t* row_out = out16 + ((size_t) h * Tq + i) * nk;
     const float* brow = bias + ((size_t) i * H + h) * extent;
     const int qp = qpos0 + i;
@@ -906,7 +913,7 @@ __global__ void attn_probs_bias_f16_kernel(const float* lg, uint16_t* out16, int
     const int j_b = max(j_lo, qp - kpos0 - extent + 1);   // from here on the distance is < extent
     float mx = -INFINITY, sum = 0.0f;
     for (int j = j_lo + tid; j < j_hi; j += kBlk) {
-        float l = __ldg(row + j) * qk_scale;
+        float l = sc_load(row + j) * qk_scale;
         if (j >= j_b) l += __ldg(brow + (qp - kpos0 - j));
         if (l > mx) {
             sum = (mx == -INFINITY ? 0.0f : sum * __expf(mx - l)) + 1.0f;
@@ -921,7 +928,7 @@ __global__ void attn_probs_bias_f16_kernel(const float* lg, uint16_t* out16, int
     const float inv = 1.0f / (bsum(s_scaled, sh) + __expf(sk - m));
     for (int j = tid; j < j_lo; j += kBlk) row_out[j] = 0;
     for (int j = j_lo + tid; j < j_hi; j += kBlk) {
-        float l = __ldg(row + j) * qk_scale;
+        float l = sc_load(row + j) * qk_scale;
         if (j >= j_b) l += __ldg(brow + (qp - kpos0 - j));
         row_out[j] = f2h(__expf(l - m) * inv);
     }
@@ -6938,9 +6945,19 @@ void attn_probs(float* lg, int Tq, int nk, int qpos0, int kpos0, float qk_scale,
 void attn_probs_bias_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk, int qpos0, int kpos0,
                          float qk_scale, const float* bias, int extent, int window, const float* sink, cudaStream_t s) {
     if (H <= 0 || Tq <= 0 || nk <= 0) return;
-    attn_probs_bias_f16_kernel<<<dim3((unsigned) Tq, (unsigned) H), kBlk, 0, s>>>(lg, out16, H, Tq, nk, qpos0, kpos0,
-                                                                                   qk_scale, bias, extent, window, sink);
+    attn_probs_bias_f16_kernel<float><<<dim3((unsigned) Tq, (unsigned) H), kBlk, 0, s>>>(lg, out16, H, Tq, nk, qpos0,
+                                                                                         kpos0, qk_scale, bias, extent,
+                                                                                         window, sink);
     check("attn_probs_bias_f16");
+}
+void attn_probs_bias_f16_h(const uint16_t* lg, uint16_t* out16, int H, int Tq, int nk, int qpos0, int kpos0,
+                           float qk_scale, const float* bias, int extent, int window, const float* sink,
+                           cudaStream_t s) {
+    if (H <= 0 || Tq <= 0 || nk <= 0) return;
+    attn_probs_bias_f16_kernel<uint16_t><<<dim3((unsigned) Tq, (unsigned) H), kBlk, 0, s>>>(lg, out16, H, Tq, nk, qpos0,
+                                                                                            kpos0, qk_scale, bias,
+                                                                                            extent, window, sink);
+    check("attn_probs_bias_f16_h");
 }
 // the Hopper kernel (wgmma) on a 9.x GPU of a build with sm_90a; IK2_WGMMA=0: the mma.sync one everywhere
 bool fa_wgmma() {
@@ -7039,10 +7056,19 @@ void attn_probs_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk, int
                     const float* r, int d_rel, const float* proj, int extent, int window, const float* sink,
                     cudaStream_t s) {
     if (H <= 0 || Tq <= 0 || nk <= 0) return;
-    attn_probs_f16_kernel<<<dim3((unsigned) Tq, (unsigned) H), kBlk, 0, s>>>(lg, out16, H, Tq, nk, qpos0, kpos0,
-                                                                              qk_scale, r, d_rel, proj, extent, window,
-                                                                              sink);
+    attn_probs_f16_kernel<float><<<dim3((unsigned) Tq, (unsigned) H), kBlk, 0, s>>>(lg, out16, H, Tq, nk, qpos0, kpos0,
+                                                                                    qk_scale, r, d_rel, proj, extent,
+                                                                                    window, sink);
     check("attn_probs_f16");
+}
+void attn_probs_f16_h(const uint16_t* lg, uint16_t* out16, int H, int Tq, int nk, int qpos0, int kpos0, float qk_scale,
+                      const float* r, int d_rel, const float* proj, int extent, int window, const float* sink,
+                      cudaStream_t s) {
+    if (H <= 0 || Tq <= 0 || nk <= 0) return;
+    attn_probs_f16_kernel<uint16_t><<<dim3((unsigned) Tq, (unsigned) H), kBlk, 0, s>>>(lg, out16, H, Tq, nk, qpos0,
+                                                                                       kpos0, qk_scale, r, d_rel, proj,
+                                                                                       extent, window, sink);
+    check("attn_probs_f16_h");
 }
 
 void gate_mul(float* o, const float* g, size_t n, cudaStream_t s) {
