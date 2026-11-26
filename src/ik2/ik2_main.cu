@@ -7612,14 +7612,24 @@ int main(int argc, char** argv) {
             };
             size_t L = 0;   // (a picture's position is the same only with the same rows: its hash beside its token)
             auto hsig = [&](size_t i) { return i < hist_sig.size() ? hist_sig[i] : (uint64_t) 0; };
+            auto state_match = [&]() {   // (the prefix of the request the engine's state actually holds)
+                L = 0;
+                while (L < hist.size() && L < ids.size() && hist[L] == ids[L] && hsig(L) == sig[L]) ++L;
+            };
+            state_match();
             if (g_ccache) {
                 // (IK2_CCACHE, rung 1a: a snapshot whose WHOLE prefix this request shares, the deepest one, is restored
                 //  before the match below runs - so a request from an earlier conversation resumes where it left off
-                //  instead of prefilling from zero.  A strict prefix only: the same prompt again is the path below's.)
+                //  instead of prefilling from zero.  A strict prefix only: the same prompt again is the path below's.
+                //  A snapshot carries the short convs' histories and the sliding layers' windows; a FULL layer's K / V
+                //  is not in it, because positions are only rewritten - so those rows are right for this request only
+                //  where the request still agrees with hist, and a restore may not reach past L.  Reaching past it is
+                //  what let a short prompt inherit a long prompt's keys: its conv state came back, its full-layer rows
+                //  were the other prompt's, and every token generated attended to them.)
                 int bsn = -1, bp = 0;
                 for (int i = 0; i < (int) snaps.size(); ++i) {
                     const Snap& s2 = snaps[i];
-                    if (s2.pos <= 0 || s2.pos > (int) ids.size() || (int) s2.ids.size() < s2.pos) continue;
+                    if (s2.pos <= 0 || (size_t) s2.pos > L || (int) s2.ids.size() < s2.pos) continue;
                     int k = 0;
                     while (k < s2.pos && s2.ids[(size_t) k] == ids[(size_t) k]) ++k;
                     if (k == s2.pos && s2.pos > bp) bp = s2.pos, bsn = i;
@@ -7630,12 +7640,12 @@ int main(int argc, char** argv) {
                     hist_sig = snaps[bsn].sig;
                     if ((int) hist_sig.size() > bp) hist_sig.resize((size_t) bp);
                     last = bp == (int) ids.size() ? snaps[bsn].last : std::vector<float>();
+                    state_match();   // (the state is the snapshot's prefix now - and the request's over exactly it)
                     if (getenv("IK2_CCACHE_LOG"))
-                        std::printf("conversation cache: restored the snapshot at %d of the request's %zu tokens\n", bp,
-                                    ids.size());
+                        std::printf("conversation cache: restored the snapshot at %d of the request's %zu tokens "
+                                    "(state held %d)\n", bp, ids.size(), (int) L);
                 }
             }
-            while (L < hist.size() && L < ids.size() && hist[L] == ids[L] && hsig(L) == sig[L]) ++L;
             if (L < hist.size() || L == ids.size()) {
                 // back to the latest snapshot at or before L that leaves a token to run (one past it is dropped:
                 // its position's state follows from a prefix the request does not share)
