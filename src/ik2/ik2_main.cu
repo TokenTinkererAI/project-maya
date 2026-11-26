@@ -98,12 +98,21 @@ namespace {
 
 namespace k = ik2::k;
 
+// A fatal error ends the process NOW.  std::exit runs the stdio teardown, and that takes every FILE's lock: the
+// thread that reads the prompts sits in read() holding stdin's, so exit() parked the engine for ever - the process
+// idle (no CPU, disk or GPU), the request lost, the server waiting out its stall watchdog.  _Exit runs no atexit
+// handler and takes no lock; stderr is unbuffered, so the message just printed is already out.
+[[noreturn]] void fatal_exit() {
+    std::fflush(stderr);
+    std::_Exit(1);
+}
+
 #define CU(x)                                                                                              \
     do {                                                                                                   \
         cudaError_t e_ = (x);                                                                              \
         if (e_ != cudaSuccess) {                                                                           \
             std::fprintf(stderr, "maya-ik2: %s: %s (%s:%d)\n", #x, cudaGetErrorString(e_), __FILE__, __LINE__); \
-            std::exit(1);                                                                                  \
+            fatal_exit();                                                                                  \
         }                                                                                                  \
     } while (0)
 #define CB(x)                                                                                              \
@@ -111,13 +120,13 @@ namespace k = ik2::k;
         cublasStatus_t e_ = (x);                                                                           \
         if (e_ != CUBLAS_STATUS_SUCCESS) {                                                                 \
             std::fprintf(stderr, "maya-ik2: %s: cuBLAS status %d (line %d)\n", #x, (int) e_, __LINE__);    \
-            std::exit(1);                                                                                  \
+            fatal_exit();                                                                                  \
         }                                                                                                  \
     } while (0)
 
 [[noreturn]] void die(const std::string& m) {
     std::fprintf(stderr, "maya-ik2: %s\n", m.c_str());
-    std::exit(1);
+    fatal_exit();
 }
 
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
