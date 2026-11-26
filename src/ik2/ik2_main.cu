@@ -422,6 +422,11 @@ bool g_flash = true;   // IK2_FLASH=0: the prefill's attention (FP16 KV) through
 //  score's precision changes.  Default 0: the FP32 path's bytes, sizes and kernels are exactly what they were.)
 bool g_scfp16 = false;
 bool g_scfp16_log = false;   // IK2_SCFP16_LOG=1: one line a prompt chunk naming the query tile the score cap buys
+// (IK2_SC512=1: the score buffer's FLOOR doubles, 64 Mi -> 128 Mi elements (256 -> 512 MiB with fp16 scores), so at a
+//  deep context the tile formula's cap doubles too: Tq 56 -> 112 at 100k keys, half the query blocks a pass.  Nothing
+//  else changes - same kernels, same loop, only more slots.  Off: the floor and every byte stay what they were.)
+bool g_sc512 = false;
+size_t g_lg_floor = (size_t) 64 << 20;   // (scores: the score buffer's floor, lg_cap's lower bound)
 int g_n_sm = 0;
 bool g_group = true;   // IK2_GROUP=0: 2 .. 8 tokens' experts a slot at a time, their attention a head at a time
 bool g_group_exp = true, g_group_attn = true;   // (IK2_GROUP=1: the experts grouped only, 2: the attention only)
@@ -1399,7 +1404,7 @@ void route_measure_report() {
 //  lg_cap counts SCORES - IK2_SCFP16 stores them as FP16 (2 B) instead of FP32 (4 B), so the same bytes hold twice as
 //  many and the tile formula's cap doubles.)
 static size_t lg_score_cap(const Config& c, int ctx) {
-    return std::max((size_t) 8 * c.H * (size_t) ctx + (size_t) 8 * c.H * 128 * 130, (size_t) 64 << 20);
+    return std::max((size_t) 8 * c.H * (size_t) ctx + (size_t) 8 * c.H * 128 * 130, g_lg_floor);
 }
 
 struct Work {
@@ -5758,6 +5763,8 @@ int main(int argc, char** argv) {
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
     g_scfp16 = getenv("IK2_SCFP16") && std::atoi(getenv("IK2_SCFP16"));
     g_scfp16_log = getenv("IK2_SCFP16_LOG") != nullptr;
+    g_sc512 = getenv("IK2_SC512") && std::atoi(getenv("IK2_SC512"));
+    if (g_sc512) g_lg_floor = (size_t) 128 << 20;
 #ifdef STRATA_USE_HIP
     if (!k::attn_flash_available()) g_flash = false;   // (AMD: the fused prompt attention where its kernel is built)
 #endif
@@ -6532,8 +6539,9 @@ int main(int argc, char** argv) {
     }
     {   // (IK2_SCFP16: what the prefill attention's score buffer holds, and the query tile that buys at the widest context)
         const size_t sc = lg_score_cap(c, ctx), cap = g_scfp16 ? 2 * sc : sc;
-        std::printf("attention scores: %s, %.0f MiB, %zu scores (Tq %zu at --max-context %d)\n",
-                    g_scfp16 ? "FP16 (IK2_SCFP16=1)" : "FP32 (IK2_SCFP16=0)", (double) (sc * 4) / 1048576.0, cap,
+        std::printf("attention scores: %s%s, %.0f MiB, %zu scores (Tq %zu at --max-context %d)\n",
+                    g_scfp16 ? "FP16 (IK2_SCFP16=1)" : "FP32 (IK2_SCFP16=0)",
+                    g_sc512 ? " + 512 MiB floor (IK2_SC512=1)" : "", (double) (sc * 4) / 1048576.0, cap,
                     std::max<size_t>(1, cap / ((size_t) c.H * (size_t) ctx)), ctx);
         std::fflush(stdout);
     }
