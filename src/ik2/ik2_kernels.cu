@@ -4999,6 +4999,107 @@ __global__ void attn_combine_kernel(const float* sink, const float* part, int H,
     out[((size_t) qi * H + h) * 128 + tid] = (o / den) * v_inv_scale;
 }
 
+// ---- AT2S (IK2_AT2S=1): attn_split_kernel's keys, a block a K / V head --------------------------------------------
+// attn_split_kernel gives a block one query head, so the R = H / Hkv heads of a K / V head each load the same K and
+// V row and convert it again - R times the bytes and R times the conversion for the same arithmetic.  Here a block
+// takes the K / V head.  A warp still takes one key a step with the same lane's 4 dims (lane * 4) and the same 32-lane
+// butterfly, so every head's arithmetic is the old kernel's own, bit for bit - the same trees, the same order, the
+// same FP32 accumulations over the same stored values; what is now shared is the row: one load of K and one of V a
+// key, converted once, used by all R heads.  The partials stay attn_split_kernel's ([p][head][130] = max, sum,
+// o[128]), so attn_combine_kernel merges them unchanged.
+constexpr int kSpHeadMax = 4;   // the R this kernel is written for (else attn_split_kernel's own)
+constexpr int kSpDRelMax = 32;  // (the bias's rank: a lane its element, as attn_split_kernel's)
+
+template <class KVT, int R>
+__global__ void __launch_bounds__(128, 4)
+attn_split_at2_kernel(const float* __restrict__ q, const float* __restrict__ r, const KVT* __restrict__ kc,
+                      const KVT* __restrict__ vc, int kv_cap, int H, int Hkv, int k0, int nk, int qpos0,
+                      float qk_scale, const float* __restrict__ proj, int d_rel, int extent, int window,
+                      float* __restrict__ part, const int* pos_d) {
+    if (pos_d) {   // (tokens of a replayed graph: the first's position read here, the keys they may see from it)
+        qpos0 = *pos_d;
+        k0 = window < (1 << 30) ? max(0, qpos0 - window + 1) : 0;
+        nk = qpos0 + (int) gridDim.z - k0;
+    }
+    __shared__ float sm_m[4 * kSpHeadMax], sm_s[4 * kSpHeadMax];   // [warp][head]
+    __shared__ __align__(16) float sm_o[kSpHeadMax * 4 * 128];     // [head][warp][dim]
+    const int g = blockIdx.x, p = blockIdx.y, P = gridDim.y, qi = blockIdx.z;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int o4 = lane * 4;   // (the lane's 4 dims: attn_split_kernel's own)
+    const int qpos = qpos0 + qi, KD = Hkv * 128;
+    const int len = (nk + P - 1) / P, j0 = p * len, j1 = min(nk, j0 + len);
+    // the lane's 4 dims of each head's q, and its element of the bias's r
+    float qh[R][4], r_lane[R];
+#pragma unroll
+    for (int h = 0; h < R; ++h) {
+        const float* qrow = q + ((size_t) qi * H + g * R + h) * 128 + o4;
+        const float4 qv = (((uintptr_t) qrow & 15) == 0) ? __ldg((const float4*) qrow)
+                                                        : make_float4(qrow[0], qrow[1], qrow[2], qrow[3]);
+        qh[h][0] = qv.x, qh[h][1] = qv.y, qh[h][2] = qv.z, qh[h][3] = qv.w;
+        r_lane[h] = (lane < d_rel) ? __ldg(r + ((size_t) qi * H + g * R + h) * d_rel + lane) : 0.0f;
+    }
+    float o_w[R][4], m_w[R], s_w[R];
+#pragma unroll
+    for (int h = 0; h < R; ++h) {
+        o_w[h][0] = o_w[h][1] = o_w[h][2] = o_w[h][3] = 0.0f;
+        m_w[h] = -INFINITY, s_w[h] = 0.0f;
+    }
+    for (int j = j0 + warp; j < j1; j += 4) {
+        const int pos = k0 + j, dist = qpos - pos;
+        if (dist < 0 || dist >= window) continue;
+        const int slot = kv_cap > 0 ? pos % kv_cap : pos;
+        const size_t off = (size_t) slot * KD + (size_t) g * 128;
+        const float4 k4 = v_load4(kc + off, lane);
+        const float4 v4 = v_load4(vc + off, lane);   // (K's and V's rows lie at the same offset)
+        const bool inb = dist < extent;
+        const float b = (inb && lane < d_rel) ? __ldg(proj + (size_t) dist * d_rel + lane) : 0.0f;
+#pragma unroll
+        for (int h = 0; h < R; ++h) {
+            const float a = qh[h][0] * k4.x + qh[h][1] * k4.y + qh[h][2] * k4.z + qh[h][3] * k4.w;
+            float l = wsum(a) * qk_scale;
+            if (inb) l += wsum(r_lane[h] * b);
+            if (l > -INFINITY) {
+                const float m_new = fmaxf(m_w[h], l);
+                const float alpha = (m_w[h] == -INFINITY) ? 0.0f : expf(m_w[h] - m_new);
+                const float beta = expf(l - m_new);
+                m_w[h] = m_new;
+                s_w[h] = s_w[h] * alpha + beta;
+                o_w[h][0] = o_w[h][0] * alpha + v4.x * beta;
+                o_w[h][1] = o_w[h][1] * alpha + v4.y * beta;
+                o_w[h][2] = o_w[h][2] * alpha + v4.z * beta;
+                o_w[h][3] = o_w[h][3] * alpha + v4.w * beta;
+            }
+        }
+    }
+    if (lane == 0)
+#pragma unroll
+        for (int h = 0; h < R; ++h) sm_m[warp * kSpHeadMax + h] = m_w[h], sm_s[warp * kSpHeadMax + h] = s_w[h];
+#pragma unroll
+    for (int h = 0; h < R; ++h)
+        *(float4*) (&sm_o[(h * 4 + warp) * 128 + o4]) = make_float4(o_w[h][0], o_w[h][1], o_w[h][2], o_w[h][3]);
+    __syncthreads();
+    const int tid = threadIdx.x;
+#pragma unroll
+    for (int h = 0; h < R; ++h) {
+        const float M = fmaxf(fmaxf(sm_m[h], sm_m[kSpHeadMax + h]),
+                              fmaxf(sm_m[2 * kSpHeadMax + h], sm_m[3 * kSpHeadMax + h]));
+        float sum = 0.0f, acc = 0.0f;
+        if (M > -INFINITY) {
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                const float mw = sm_m[w * kSpHeadMax + h];
+                if (mw == -INFINITY) continue;
+                const float f = expf(mw - M);
+                sum += sm_s[w * kSpHeadMax + h] * f;
+                acc += sm_o[(h * 4 + w) * 128 + tid] * f;
+            }
+        }
+        float* pp = part + (((size_t) qi * H + g * R + h) * P + p) * 130;
+        if (tid == 0) pp[0] = M, pp[1] = sum;
+        pp[2 + tid] = acc;
+    }
+}
+
 template <int WARPS, int ROWS>
 __global__ void mv_blocks_kernel(int type, const uint8_t* W, int N, int K, size_t rb, const float* x, float* y) {
     extern __shared__ float xs[];
@@ -7803,6 +7904,44 @@ void prep_qkv_r_fp8(float* q, const float* q_clip, const float* k_in, uint8_t* k
     check("prep_qkv_r_fp8");
 }
 
+// (IK2_AT2S=1: the same keys through attn_split_at2_kernel, where its geometry holds - R <= kSpHeadMax, d_rel <=
+//  kSpLanes, no 4-bit cache - and the kernel as it was otherwise, and by default.)
+static bool at2s_on() {
+    const char* e = std::getenv("IK2_AT2S");
+    return e && std::atoi(e) != 0;
+}
+template <class KV>
+static void attn_split_launch(const float* q, const float* r, const KV* kc, const KV* vc, int kv_cap, int H, int Hkv,
+                              int k0, int nk, int qpos0, float qk_scale, const float* proj, int d_rel, int extent,
+                              int window, float* part, const int* pos_d, int P, int nq, cudaStream_t s, int kv4 = 0,
+                              int row4 = 0, int kv4k = 0) {
+    const int R = H / Hkv;
+    if (!kv4 && !kv4k && at2s_on() && (H % Hkv) == 0 && R >= 1 && R <= kSpHeadMax && d_rel <= kSpDRelMax) {
+        const dim3 gr((unsigned) Hkv, (unsigned) P, (unsigned) nq);
+        switch (R) {
+            case 1:
+                attn_split_at2_kernel<KV, 1><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0, qk_scale,
+                                                                proj, d_rel, extent, window, part, pos_d);
+                return;
+            case 2:
+                attn_split_at2_kernel<KV, 2><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0, qk_scale,
+                                                                proj, d_rel, extent, window, part, pos_d);
+                return;
+            case 3:
+                attn_split_at2_kernel<KV, 3><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0, qk_scale,
+                                                                proj, d_rel, extent, window, part, pos_d);
+                return;
+            default:
+                attn_split_at2_kernel<KV, 4><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0, qk_scale,
+                                                                proj, d_rel, extent, window, part, pos_d);
+                return;
+        }
+    }
+    attn_split_kernel<KV><<<dim3((unsigned) H, (unsigned) P, (unsigned) nq), 128, 0, s>>>(
+        q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0, qk_scale, proj, d_rel, extent, window, part, pos_d, kv4, row4,
+        kv4k);
+}
+
 template <class KV>
 void attn_multi_impl(const float* q, const float* r, const float* sink, const KV* kc, const KV* vc, int kv_cap,
                      int nq, int H, int Hkv, int k0, int nk, int qpos0, float qk_scale, float v_inv_scale,
@@ -7814,8 +7953,8 @@ void attn_multi_impl(const float* q, const float* r, const float* sink, const KV
     }
     const int P = std::min(128, std::max(1, (nk + 63) / 64));
     float* part = scratch;
-    attn_split_kernel<KV><<<dim3(H, P, nq), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0, qk_scale, proj,
-                                                          d_rel, extent, window, part, nullptr);
+    attn_split_launch<KV>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0, qk_scale, proj, d_rel, extent, window, part,
+                          nullptr, P, nq, s);
     check("attn_multi_split");
     attn_combine_kernel<<<dim3(H, nq), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out);
     check("attn_multi_combine");
@@ -7897,8 +8036,8 @@ void attn_decode_impl(const float* q, const float* r, const float* sink, const K
         return;
     }
     float* part = scratch;
-    attn_split_kernel<KV><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel,
-                                                      extent, window, part, nullptr, kv4, row4, kv4k);
+    attn_split_launch<KV>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel, extent, window, part,
+                          nullptr, P, 1, s, kv4, row4, kv4k);
     check("attn_decode_split");
     attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out);
     check("attn_decode_combine");
@@ -8006,8 +8145,8 @@ void prep_qkv_r_fp8_at(float* q, const float* q_clip, const float* k_in, uint8_t
 void attn_decode_f16_at(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
                         int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s) {
-    attn_split_kernel<uint16_t><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj,
-                                                            d_rel, extent, window, scratch, pos);
+    attn_split_launch<uint16_t>(q, r, kc, vc, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj, d_rel, extent, window, scratch,
+                                pos, P, 1, s);
     check("attn_decode_f16_at (split)");
     attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, 1.0f, out);
     check("attn_decode_f16_at (combine)");
@@ -8016,8 +8155,8 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, float v_inv_scale,
                         const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
                         cudaStream_t s) {
-    attn_split_kernel<uint8_t><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj, d_rel,
-                                                           extent, window, scratch, pos);
+    attn_split_launch<uint8_t>(q, r, kc, vc, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj, d_rel, extent, window, scratch,
+                               pos, P, 1, s);
     check("attn_decode_fp8_at (split)");
     attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, v_inv_scale, out);
     check("attn_decode_fp8_at (combine)");

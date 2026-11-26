@@ -2494,8 +2494,10 @@ void test_fp8_kv() {
     }
 
     // 3. attn_decode_fp8 & attn_multi_fp8 (linear & ring buffer) vs double reference
-    {
-        const int H = 48, KV = 8, D = 128, d_rel = 16, ctx = 3100, kv_cap = 1056, window = 1024, nq = 8;
+    // (two geometries: 6 heads a K / V head, and the model's 3 - the second is the AT2S kernel's own, and both meet
+    //  the double reference)
+    for (const int H : {48, 24}) {
+        const int KV = 8, D = 128, d_rel = 16, ctx = 3100, kv_cap = 1056, window = 1024, nq = 8;
         const float k_inv = 1.0f / 16.0f, v_inv = 1.0f / 32.0f, scale = 1.0f / std::sqrt(128.0f);
         std::vector<uint8_t> kc_lin((size_t) ctx * KV * D), vc_lin((size_t) ctx * KV * D);
         for (size_t i = 0; i < kc_lin.size(); ++i) {
@@ -2562,8 +2564,9 @@ void test_fp8_kv() {
             }
             // (V spans E4M3's whole range, so an output is terms up to ~448 that cancel - F32 rounds each at ~6e-8,
             //  over up to 2500 of them ~sqrt(2500) x 6e-8: the absolute part follows the terms' size, 3e-6 of it)
-            expect(ring ? "attn_decode_fp8 ring 1056" : "attn_decode_fp8 linear 2500", host(one, want.size()), want,
-                   2e-4, std::max(1e-6, 3e-6 * mag));
+            const std::string what = std::string(ring ? "attn_decode_fp8 ring 1056" : "attn_decode_fp8 linear 2500") +
+                                     (H == 24 ? ", 3 heads a K/V" : "");
+            expect(what.c_str(), host(one, want.size()), want, 2e-4, std::max(1e-6, 3e-6 * mag));
         }
 
         const int pos0 = 2500, k0 = pos0 - window + 1, nk = pos0 + nq - k0;
@@ -2579,10 +2582,55 @@ void test_fp8_kv() {
             const auto o1 = host(one, (size_t) H * D);
             for (size_t j = 0; j < o1.size(); ++j) want[(size_t) qi * H * D + j] = o1[j];
         }
-        expect("attn_multi_fp8 ring 1056", got, want, 1e-4, 1e-6);
+        const std::string whatm = std::string("attn_multi_fp8 ring 1056") + (H == 24 ? ", 3 heads a K/V" : "");
+        expect(whatm.c_str(), got, want, 1e-4, 1e-6);
 
         for (uint8_t* p : {dk_lin, dv_lin, dk_ring, dv_ring}) cudaFree(p);
         for (float* p : {dq, dr, ds, dp, scratch, out, one}) cudaFree(p);
+    }
+
+    // 3b. attn_split_kernel vs its AT2S twin on the same inputs (IK2_AT2S toggled between the two launches):
+    //     the model's geometry, a ring cache and a full one, so "lossless" is a number, not a claim
+    if (true) {
+        const int H = 24, KV = 8, D = 128, d_rel = 16, nk = 1056, qpos = 1055, kv_cap = 1056;
+        const float scale = 1.0f / std::sqrt(128.0f);
+        std::vector<uint8_t> kc((size_t) nk * KV * D), vc((size_t) nk * KV * D);
+        for (size_t i = 0; i < kc.size(); ++i) {
+            uint8_t bk = (uint8_t) (rng() & 0xFFu), bv = (uint8_t) (rng() & 0xFFu);
+            if ((bk & 0x7F) >= 0x7E) bk = (bk & 0x80u) | 0x60u;
+            if ((bv & 0x7F) >= 0x7E) bv = (bv & 0x80u) | 0x60u;
+            kc[i] = bk, vc[i] = bv;
+        }
+        auto q = fvec((size_t) H * D, 3.0f), r = fvec((size_t) H * d_rel, 2.0f), sink = fvec((size_t) H, 3.0f),
+             proj = fvec((size_t) 1024 * d_rel);
+        uint8_t* dk = dev(kc), *dv = dev(vc);
+        float *dq = dev(q), *dr = dev(r), *ds = dev(sink), *dp = dev(proj);
+        float* scratch = dev_n<float>(k::attn_decode_mma_scratch(H, 64) + (size_t) H * (nk + 32 * 130));
+        float* o_old = dev_n<float>((size_t) H * D), *o_new = dev_n<float>((size_t) H * D);
+        for (int ring = 0; ring < 2; ++ring) {
+            const int cap = ring ? kv_cap : 0, k0 = 0;
+            unsetenv("IK2_AT2S");
+            k::attn_decode_fp8(dq, dr, ds, dk, dv, cap, H, KV, D, k0, nk, qpos, scale / 16.0f, 1.0f / 32.0f, dp, d_rel,
+                               1024, ring ? 1024 : (1 << 30), scratch, o_old, 0);
+            setenv("IK2_AT2S", "1", 1);
+            k::attn_decode_fp8(dq, dr, ds, dk, dv, cap, H, KV, D, k0, nk, qpos, scale / 16.0f, 1.0f / 32.0f, dp, d_rel,
+                               1024, ring ? 1024 : (1 << 30), scratch, o_new, 0);
+            unsetenv("IK2_AT2S");
+            CU(cudaDeviceSynchronize());
+            const auto a = host(o_old, (size_t) H * D), b = host(o_new, (size_t) H * D);
+            double mx = 0, mxrel = 0, mag = 0;
+            size_t ne = 0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                const double d = std::fabs((double) a[i] - b[i]);
+                mx = std::max(mx, d), mag = std::max(mag, (double) std::fabs(a[i]));
+                if (d != 0.0) ++ne;
+                if (a[i] != 0.0f) mxrel = std::max(mxrel, d / std::fabs((double) a[i]));
+            }
+            std::printf("ok   attn AT2S vs split %s: %zu of %zu differ, max|d| %.3e, max rel %.3e, |o|max %.3e\n",
+                        ring ? "ring 1056" : "full 1056", ne, a.size(), mx, mxrel, mag);
+        }
+        for (uint8_t* p2 : {dk, dv}) cudaFree(p2);
+        for (float* p2 : {dq, dr, ds, dp, scratch, o_old, o_new}) cudaFree(p2);
     }
 
     // 4. attn_decode_fp8 with nk > 16384 (exercises P = 128 splits and kv_cap = 0 full-layer path)
