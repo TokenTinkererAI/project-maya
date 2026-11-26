@@ -2309,8 +2309,17 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         CU(cudaStreamSynchronize(g_cs));
         g_seq_done = g_seq_next - 1;
     }
+    // (IK2_TAIL_SKIP's fill: a slot left out takes, at weight 0, an expert its own token already picked, so one token
+    //  can hold two slots of one expert and this visit's picks are not distinct per token.  The experts' scratch is one
+    //  row a TOKEN (ex16, h16, y32 are [T]), so an expert's rows are counted a token at a time: a repeated slot shares
+    //  its pick's row and its weight adds into that one row (0 + w).  Counting slots instead let the expert every fill
+    //  lands on - a popular resident one - pass T rows, and gather_f16_16 then wrote past the scratch: an illegal
+    //  access that needed a wide enough prompt (a chunk of 4096 tokens or more here) to reach.  A duplicated row also
+    //  raced its own token's row in scatter_add_rows, whose += is not atomic.  No slot left out: nothing changes.)
+    auto repeat_slot = [&](int i) { return i % c.K != 0 && top[i] == top[i - 1]; };
     std::fill(W.cnt.begin(), W.cnt.end(), 0);
-    for (int i = 0; i < S; ++i) ++W.cnt[top[i]];
+    for (int i = 0; i < S; ++i)
+        if (!repeat_slot(i)) ++W.cnt[top[i]];
     if (W.use.empty()) W.use.assign((size_t) c.n_layer * c.E, 0), W.use_tot.assign(c.n_layer, 0);
     const int prl = l % Work::kPfRing;
     const bool pf_here = W.pf_layers[prl] == l && (int) W.pf_bs[prl].size() == c.E;
@@ -2335,12 +2344,18 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
     float* wt = W.wt_h[ps];
     float* wtr = W.wtr_h[ps];
     for (int i = 0; i < S; ++i) {
-        const int e = top[i], row = W.fill[e]++;
+        const int e = top[i];
+        wt[i] = w[i] * (Ly.scale[2].empty() ? 1.0f : Ly.scale[2][e]);
+        if (repeat_slot(i)) {   // (the fill: its pick's row, its weight - 0 - added into that row's)
+            inv[i] = inv[i - 1];
+            wtr[inv[i]] += wt[i];
+            continue;
+        }
+        const int row = W.fill[e]++;
         gidx[row] = i / c.K;
         inv[i] = row;
         sg[row] = Ly.scale[0].empty() ? 1.0f : Ly.scale[0][e];
         su[row] = Ly.scale[1].empty() ? 1.0f : Ly.scale[1][e];
-        wt[i] = w[i] * (Ly.scale[2].empty() ? 1.0f : Ly.scale[2][e]);
         wtr[row] = wt[i];
     }
 
