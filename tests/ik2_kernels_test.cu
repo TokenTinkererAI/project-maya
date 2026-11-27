@@ -22,6 +22,15 @@
 #include <random>
 #include <vector>
 
+#if defined(_WIN32)
+// Windows has no setenv/unsetenv (the lab's test toggles IK2_AT2S through the process env):
+// _putenv_s with an empty value removes the variable, which is what unsetenv does.
+static int ik2_test_setenv(const char* name, const char* value) { return _putenv_s(name, value); }
+static int ik2_test_unsetenv(const char* name) { return _putenv_s(name, ""); }
+#define setenv(name, value, overwrite) ik2_test_setenv((name), (value))
+#define unsetenv(name) ik2_test_unsetenv(name)
+#endif
+
 namespace k = ik2::k;
 
 namespace {
