@@ -327,6 +327,10 @@ bool g_fuse = false;         // IK2_FUSE: the host token path's combine + short 
 //  21,520 -> 11,037 a run, for +0.033 mean NLL and top-1 token identical on all 511 scored positions (and 2,047/2,047
 //  at 2K); 0.20 was faster (+11 pct) for +0.101 NLL.  IK2_CACHE_BIAS=0 restores the model's table exactly.)
 float g_cache_bias = 0.15f;
+// (IK2_KNOB_CHEAP=1: IK2_CACHE_BIAS and IK2_TAIL_SKIP count an expert the CPU lane will serve as cheap beside a
+//  resident one - the corrected predicate.  Off (the engine's default): the knobs test residency alone, exactly the
+//  behaviour before the correction existed.)
+bool g_knob_cheap = false;
 // (IK2_TAIL_SKIP=N, 0: off - after the top-K pick, a pick of rank N or past it (0-based: N=4 -> ranks 5..8) whose
 //  expert the tier does not hold is left out and not fetched; the kept picks are rescaled to sum to the scale the
 //  full K summed to, so the combine stays scale-correct.  The slot keeps a resident pick's expert at weight 0 - the
@@ -1370,9 +1374,10 @@ void route_tables(Layer& Ly, ExpertCache& EC, int l) {
         moved = moved || r != Ly.resid_h[(size_t) e];
         Ly.resid_h[(size_t) e] = r;
     }
-    // (the cheap table: the splitter's own order - ascending expert id, the lane's first ceil(share x n_nonres))
+    // (IK2_KNOB_CHEAP: the cheap table - the splitter's own order, ascending expert id, the lane's first
+    //  ceil(share x n_nonres).  Gate off: no table is built and no traffic is added; the kernels get resid_d alone.)
     bool cheap_moved = false;
-    {
+    if (g_knob_cheap) {
         const double share = (g_cpu_frac > 0 && g_pool) ? (g_cpu_share > 0 ? g_cpu_share : g_cpu_frac) : 0.0;
         int n_non = 0;
         for (int e = 0; e < E; ++e) n_non += Ly.resid_h[(size_t) e] ? 0 : 1;
@@ -1389,8 +1394,9 @@ void route_tables(Layer& Ly, ExpertCache& EC, int l) {
     if (moved) CU(cudaMemcpyAsync(Ly.resid_d, Ly.resid_h.data(), (size_t) E, cudaMemcpyHostToDevice, g_s));
     if (cheap_moved) CU(cudaMemcpyAsync(Ly.cheap_d, Ly.cheap_h.data(), (size_t) E, cudaMemcpyHostToDevice, g_s));
     if (g_cache_bias != 0.0f) {
+        const std::vector<uint8_t>& cheap_tbl = g_knob_cheap ? Ly.cheap_h : Ly.resid_h;   // (the old rule when off)
         for (int e = 0; e < E; ++e)
-            Ly.probs_k[(size_t) e] = Ly.probs_h[(size_t) e] + (Ly.cheap_h[(size_t) e] ? g_cache_bias : 0.0f);
+            Ly.probs_k[(size_t) e] = Ly.probs_h[(size_t) e] + (cheap_tbl[(size_t) e] ? g_cache_bias : 0.0f);
         CU(cudaMemcpyAsync(Ly.probs_b, Ly.probs_k.data(), (size_t) E * 4, cudaMemcpyHostToDevice, g_s));
     }
 }
@@ -6025,6 +6031,7 @@ int main(int argc, char** argv) {
     g_cache_bias = bias_named ? (float) std::atof(getenv("IK2_CACHE_BIAS")) : 0.15f;
     const bool tail_named = getenv("IK2_TAIL_SKIP") != nullptr;
     g_tail_skip = tail_named ? std::atoi(getenv("IK2_TAIL_SKIP")) : 4;
+    g_knob_cheap = getenv("IK2_KNOB_CHEAP") && std::atoi(getenv("IK2_KNOB_CHEAP")) != 0;
     if (g_tail_skip < 0 || g_tail_skip > 7) die("IK2_TAIL_SKIP: 0 .. 7 (0: off; N: the picks of rank N + 1 .. K left "
                                                 "out when the tier does not hold them)");
     if ((g_cache_bias != 0.0f || g_tail_skip > 0) && n_gpu > 1) {
@@ -6404,9 +6411,11 @@ int main(int argc, char** argv) {
             Ly.resid_h.assign((size_t) c.E, 0);
             Ly.resid_d = dalloc<uint8_t>((size_t) c.E);
             CU(cudaMemset(Ly.resid_d, 0, (size_t) c.E));   // (the table route_tables' first "no move" assumes)
-            Ly.cheap_h.assign((size_t) c.E, 0);
-            Ly.cheap_d = dalloc<uint8_t>((size_t) c.E);
-            CU(cudaMemset(Ly.cheap_d, 0, (size_t) c.E));
+            if (g_knob_cheap) {   // (IK2_KNOB_CHEAP: the cheap table; off, the kernels get resid_d and the old rule)
+                Ly.cheap_h.assign((size_t) c.E, 0);
+                Ly.cheap_d = dalloc<uint8_t>((size_t) c.E);
+                CU(cudaMemset(Ly.cheap_d, 0, (size_t) c.E));
+            }
         }
         Ly.ffn_norm = load_f32(S, b + "ffn_norm.weight", C);
         if (Ly.sliding) {
@@ -7351,6 +7360,8 @@ int main(int argc, char** argv) {
     if (g_tail_skip > 0)
         std::printf("tail skip: ranks %d..%d left out when not in VRAM (IK2_TAIL_SKIP=0 turns it off)\n",
                     g_tail_skip + 1, M.c.K);
+    if (g_knob_cheap)
+        std::printf("knob predicate: cheap = in VRAM or lane-served (IK2_KNOB_CHEAP)\n");
     std::fflush(stdout);
     }
     // the caches' counters, summed over the GPUs

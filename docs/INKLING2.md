@@ -160,6 +160,17 @@ fetched for somebody anyway, so the prompt keeps its picks). Maya's default is `
 that is 10,871 expert misses a run turned into 4,787 and 31.6 -> 32.5 tok/s for +0.05 mean NLL; `IK2_TAIL_SKIP=0`
 turns it off, and it stays a poorer trade than the bias (which buys 29.0 -> 31.9 for +0.03) if quality is the priority.
 
+`IK2_KNOB_CHEAP=1` widens both knobs' "cheap" test from residency alone to residency **or a CPU lane-served miss**
+(with `IK2_CPU_FRAC > 0`): a lane-served miss is never resident, yet costs no fetch, so under the gate it takes the
+bias and keeps its tail pick. The lane's set is the splitter's own - a visit's misses ascending by expert id, the
+first `ceil(share x n_miss)` to the lane, applied over the tier's non-resident set. Off (the default, and the live
+config) the knobs test residency only, exactly as they did before the gate existed: 18.0 tok/s at `CPU_FRAC=0.5`,
+2.9286 mean NLL and 19.8 pct top-1 flips against the lane-off run on the 8 GB box. On, that arm is 16.56-16.57 tok/s
+(-8.4 to -8.8 pct) for 2.89-2.90 mean NLL (-0.037 to -0.054, two rounds) and 14.9-15.7 pct flips against 18.8-19.8
+off - quality-first, and the live split moves it run to run; at `CPU_FRAC=1.0` it makes both knobs inert
+(2.8468 mean NLL, the knobs-off value) and costs 22 pct of the speed there. The lane cannot be widened on this box
+(7 workers is its ceiling), so the gate stays off unless quality is the priority.
+
 **Two GPUs** (`--gpus 2`, outside the preview of section 8: with `IK2_UNSUPPORTED=1`): `IK2_EP=1` deals each layer's experts to both by how often they are picked
 (`IK2_EP_SPLIT`, GPU 1's share), each GPU with its own cache and link; attention and the KV cache stay on GPU 0.
 Without it the layers are split between the GPUs.
