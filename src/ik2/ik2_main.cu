@@ -230,6 +230,10 @@ struct Layer {
     std::vector<float> probs_h, probs_k;
     uint8_t* resid_d = nullptr;
     std::vector<uint8_t> resid_h;
+    // (IK2_CPU_FRAC: the cheap table the two knobs read when a lane is on - 1 where the expert is in VRAM OR the
+    //  CPU lane will take it, so a lane-served miss is not mistaken for a fetch.  Built with resid_h in route_tables.)
+    uint8_t* cheap_d = nullptr;
+    std::vector<uint8_t> cheap_h;
     float *attn_norm, *q_in_norm, *k_in_norm, *v_in_norm, *ffn_norm;
     float *q_clip, *r_clip, *rel_proj;             // [H][D], [H][d_rel], [extent][d_rel]
     float *res_score, *ffn_res_score;              // [nq][C], [C]
@@ -1346,11 +1350,17 @@ struct ExpertCache {
     }
 };
 
-// IK2_CACHE_BIAS / IK2_TAIL_SKIP: the layer's tier table on the device (1: the expert in VRAM) and, when the bias is
-// set, the router bias with F added to the residents.  Built from the cache's own loc[] - the table the banner's
-// "N of M experts in VRAM" counts and get() moves, so it is the residency the fetch path acts on, not a second guess -
-// and remade only when a slot moved (a token's visit can evict, so it is checked at each routing, not once).
-// A knob that is off touches nothing: probs_b stays the model's, and resid_d is null for the kernels.
+// IK2_CACHE_BIAS / IK2_TAIL_SKIP: the layer's cheap table on the device and, when the bias is set, the router bias
+// with F added to the cheap experts.  Built from the cache's own loc[] - the table the banner's "N of M experts in
+// VRAM" counts and get() moves, so it is the residency the fetch path acts on, not a second guess - and remade when a
+// slot moved (a token's visit can evict, so it is checked at each routing, not once).
+//
+// "Cheap" is residency OR the CPU lane: a lane-served miss is never resident and yet costs no fetch.  The splitter
+// (the visit's IK2_CPU_FRAC block) sorts the visit's misses by expert id and gives the first ceil(share x n_miss) to
+// the lane, so over the tier's non-resident set the same order and the same cap is the first ceil(share x n_nonres)
+// by id - the set the lane will be offered.  share is the splitter's own moving share (g_cpu_share).  With no lane
+// (IK2_CPU_FRAC=0, or no pool) the cheap table is the residency table, so both knobs behave exactly as before.
+// A knob that is off touches nothing: probs_b stays the model's, and resid_d / cheap_d are null for the kernels.
 void route_tables(Layer& Ly, ExpertCache& EC, int l) {
     if (!g_cache_bias && !g_tail_skip) return;
     const int E = EC.E;
@@ -1360,11 +1370,27 @@ void route_tables(Layer& Ly, ExpertCache& EC, int l) {
         moved = moved || r != Ly.resid_h[(size_t) e];
         Ly.resid_h[(size_t) e] = r;
     }
-    if (!moved) return;
-    CU(cudaMemcpyAsync(Ly.resid_d, Ly.resid_h.data(), (size_t) E, cudaMemcpyHostToDevice, g_s));
+    // (the cheap table: the splitter's own order - ascending expert id, the lane's first ceil(share x n_nonres))
+    bool cheap_moved = false;
+    {
+        const double share = (g_cpu_frac > 0 && g_pool) ? (g_cpu_share > 0 ? g_cpu_share : g_cpu_frac) : 0.0;
+        int n_non = 0;
+        for (int e = 0; e < E; ++e) n_non += Ly.resid_h[(size_t) e] ? 0 : 1;
+        const int take = share > 0 ? std::min(n_non, (int) std::ceil(share * (double) n_non)) : 0;
+        int seen = 0;
+        for (int e = 0; e < E; ++e) {
+            const bool cheap = Ly.resid_h[(size_t) e] || seen < take;
+            cheap_moved = cheap_moved || (uint8_t) cheap != Ly.cheap_h[(size_t) e];
+            Ly.cheap_h[(size_t) e] = (uint8_t) cheap;
+            if (!Ly.resid_h[(size_t) e]) ++seen;
+        }
+    }
+    if (!moved && !cheap_moved) return;
+    if (moved) CU(cudaMemcpyAsync(Ly.resid_d, Ly.resid_h.data(), (size_t) E, cudaMemcpyHostToDevice, g_s));
+    if (cheap_moved) CU(cudaMemcpyAsync(Ly.cheap_d, Ly.cheap_h.data(), (size_t) E, cudaMemcpyHostToDevice, g_s));
     if (g_cache_bias != 0.0f) {
         for (int e = 0; e < E; ++e)
-            Ly.probs_k[(size_t) e] = Ly.probs_h[(size_t) e] + (Ly.resid_h[(size_t) e] ? g_cache_bias : 0.0f);
+            Ly.probs_k[(size_t) e] = Ly.probs_h[(size_t) e] + (Ly.cheap_h[(size_t) e] ? g_cache_bias : 0.0f);
         CU(cudaMemcpyAsync(Ly.probs_b, Ly.probs_k.data(), (size_t) E * 4, cudaMemcpyHostToDevice, g_s));
     }
 }
@@ -2996,7 +3022,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         const bool exp_tc = exp_mma && !g_lane && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
-                       exp_tc ? (uint16_t*) W.gu32 : nullptr, Ly.resid_d, g_tail_skip);
+                       exp_tc ? (uint16_t*) W.gu32 : nullptr, Ly.resid_d, g_tail_skip, Ly.cheap_d);
         route_measure(W.rlog, Ly.probs_b, 1, c.E);
         if (g_off) {   // (the offload path: the picks the tier does not hold copied into staging, their slots filled)
             const auto& st = g_offs.stage[g_offs.pool[l]];
@@ -3919,7 +3945,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         route_tables(Ly, dev_cache(0), l);
-        k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s, Ly.resid_d, g_tail_skip);
+        k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s, Ly.resid_d, g_tail_skip, Ly.cheap_d);
         route_measure(W.rlog, Ly.probs_b, T, c.E);
         k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], g_blk.blob, g_blk.n,
                        g_blk.tok, g_blk.row, g_blk.sg, g_blk.su, g_blk.wt, g_blk.inv, g_s);
@@ -4450,7 +4476,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         route_tables(Ly, EC, l);
-        k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s, Ly.resid_d, g_tail_skip);
+        k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s, Ly.resid_d, g_tail_skip, Ly.cheap_d);
         route_measure(W.rlog, Ly.probs_b, T, c.E);
         CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
         // (IK2_SYNC_KILL: the routing's D2H is a few dozen bytes, so the host waits on a 4-byte flag the same stream
@@ -5296,7 +5322,7 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         route_tables(Ly, EC, l);
-        k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s, Ly.resid_d, g_tail_skip);
+        k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s, Ly.resid_d, g_tail_skip, Ly.cheap_d);
         route_measure(W.rlog, Ly.probs_b, T, c.E);
         CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
         CU(cudaStreamSynchronize(g_s));
@@ -6378,6 +6404,9 @@ int main(int argc, char** argv) {
             Ly.resid_h.assign((size_t) c.E, 0);
             Ly.resid_d = dalloc<uint8_t>((size_t) c.E);
             CU(cudaMemset(Ly.resid_d, 0, (size_t) c.E));   // (the table route_tables' first "no move" assumes)
+            Ly.cheap_h.assign((size_t) c.E, 0);
+            Ly.cheap_d = dalloc<uint8_t>((size_t) c.E);
+            CU(cudaMemset(Ly.cheap_d, 0, (size_t) c.E));
         }
         Ly.ffn_norm = load_f32(S, b + "ffn_norm.weight", C);
         if (Ly.sliding) {

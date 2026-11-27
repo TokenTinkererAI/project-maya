@@ -2466,8 +2466,9 @@ __global__ void route_kernel(const float* logits, const float* bias, int T, int 
 //  a decode's T = 1 that is the old rule exactly (the picks are distinct experts, so a deep pick is resident or
 //  fetched for it alone); over a prompt's tokens it is what makes the knob honest: at 2,048 tokens nearly every
 //  expert is fetched for some token anyway, so the old rule dropped picks for no copy saved.)
-__global__ void tail_seed_kernel(int* need, const uint8_t* resid, int E) {
-    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < E; e += blockDim.x * gridDim.x) need[e] = resid[e];
+__global__ void tail_seed_kernel(int* need, const uint8_t* resid, const uint8_t* cheap, int E) {
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < E; e += blockDim.x * gridDim.x)
+        need[e] = resid[e] | cheap[e];
 }
 // a deep pick's expert is needed by this batch when it is some token's rank < tail_n pick: that pick is always kept
 __global__ void tail_mark_kernel(const int* top, const uint8_t* rank, int S, int tail_n, int* need) {
@@ -2479,8 +2480,8 @@ __global__ void tail_mark_kernel(const int* top, const uint8_t* rank, int S, int
 // them), so nothing is fetched for it.  `need == nullptr` is the decode's T = 1 fast path: there the batch's need
 // set is the tier's table and nothing else (a second pick of the same expert cannot exist within one token's K),
 // so the seed and the mark are skipped and this one kernel is the whole pass.
-__global__ void tail_apply_kernel(int* top, float* w, const uint8_t* rank, const int* need, const uint8_t* resid, int K,
-                                  int tail_n, float scale) {
+__global__ void tail_apply_kernel(int* top, float* w, const uint8_t* rank, const int* need, const uint8_t* resid,
+                                  const uint8_t* cheap, int K, int tail_n, float scale) {
     const int t = blockIdx.x;
     if (threadIdx.x) return;
     int* tp = top + (size_t) t * K;
@@ -2489,7 +2490,7 @@ __global__ void tail_apply_kernel(int* top, float* w, const uint8_t* rank, const
     bool keep[kRouteMax];
     int nkeep = 0;
     for (int k = 0; k < K; ++k) {
-        keep[k] = rk[k] < tail_n || (need ? need[tp[k]] : resid[tp[k]]) != 0;
+        keep[k] = rk[k] < tail_n || (need ? need[tp[k]] : (resid[tp[k]] | cheap[tp[k]])) != 0;
         nkeep += keep[k] ? 1 : 0;
     }
     if (nkeep == K) return;   // (nothing left out: the router's own weights, to the bit)
@@ -5303,7 +5304,8 @@ __global__ void route_token_kernel(const float* __restrict__ logits, const float
                                    float scale, const uint8_t* const* __restrict__ tab, const float* __restrict__ sg_t,
                                    const float* __restrict__ su_t, const float* __restrict__ sd_t, int* top, float* w,
                                    const uint8_t** blob, int* tok, int* inv, float* sg, float* su, float* wt,
-                                   const float* x, int width, uint16_t* x_limbs, const uint8_t* resid, int tail_n) {
+                                   const float* x, int width, uint16_t* x_limbs, const uint8_t* resid, int tail_n,
+                                   const uint8_t* cheap) {
     if (blockIdx.x) {   // (the blocks after the first: x = hi + lo in FP16, [2][width] - experts_gate_up_swiglu_mma's input)
         const int i = (blockIdx.x - 1) * blockDim.x + threadIdx.x;
         if (i < width) {
@@ -5352,14 +5354,14 @@ __global__ void route_token_kernel(const float* __restrict__ logits, const float
         su[pos] = su_t ? su_t[e] : 1.0f;
         wt[pos] = wk * (sd_t ? sd_t[e] : 1.0f);
     }
-    if (tail_n > 0 && resid) {   // (IK2_TAIL_SKIP: the deep picks the tier does not hold, left out of the K slots)
+    if (tail_n > 0 && resid && cheap) {   // (IK2_TAIL_SKIP: the deep picks neither resident nor lane-served, out)
         __syncthreads();
         if (e == 0) {
             bool keep[kRouteMax];
             float sum = 0.0f;
             int low = -1, any = -1;   // (as route_warp_kernel's: the lowest kept expert in VRAM, else the lowest kept)
             for (int k = 0; k < K; ++k) {
-                keep[k] = rks[k] < tail_n || resid[top[k]] != 0;
+                keep[k] = rks[k] < tail_n || (resid[top[k]] | cheap[top[k]]) != 0;
                 if (keep[k]) sum += sig[k];
             }
             for (int k = 0; k < K; ++k) {
@@ -7118,27 +7120,30 @@ void tail_scratch(int E, size_t S, int** need, uint8_t** rank, cudaStream_t s) {
 }
 // the tail pass over a batch the router above has just written: need = the tier's residents, then every rank <
 //  tail_n pick's expert, then the per-token apply
-void tail_pass(int T, int E, int K, float scale, int* top, float* w, const uint8_t* resid, int tail_n, cudaStream_t s) {
+void tail_pass(int T, int E, int K, float scale, int* top, float* w, const uint8_t* resid, const uint8_t* cheap,
+               int tail_n, cudaStream_t s) {
     int* need = nullptr;
     uint8_t* rank = nullptr;
     const int S = T * K;
+    if (!cheap) cheap = resid;
     tail_scratch(E, (size_t) S, &need, &rank, s);
-    if (T == 1) {   // (decode: need == the tier's table, so the seed and the mark would be pure cost - see the apply)
-        tail_apply_kernel<<<1, 32, 0, s>>>(top, w, rank, nullptr, resid, K, tail_n, scale);
+    if (T == 1) {   // (decode: need == the cheap table, so the seed and the mark would be pure cost - see the apply)
+        tail_apply_kernel<<<1, 32, 0, s>>>(top, w, rank, nullptr, resid, cheap, K, tail_n, scale);
         check("tail_apply");
         return;
     }
-    tail_seed_kernel<<<(unsigned) std::min((E + 255) / 256, 64), 256, 0, s>>>(need, resid, E);
+    tail_seed_kernel<<<(unsigned) std::min((E + 255) / 256, 64), 256, 0, s>>>(need, resid, cheap, E);
     check("tail_seed");
     tail_mark_kernel<<<(unsigned) std::min((S + 255) / 256, 1024), 256, 0, s>>>(top, rank, S, tail_n, need);
     check("tail_mark");
-    tail_apply_kernel<<<(unsigned) T, 32, 0, s>>>(top, w, rank, need, resid, K, tail_n, scale);
+    tail_apply_kernel<<<(unsigned) T, 32, 0, s>>>(top, w, rank, need, resid, cheap, K, tail_n, scale);
     check("tail_apply");
 }
 void route(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
-           cudaStream_t s, const uint8_t* resid, int tail_n) {
+           cudaStream_t s, const uint8_t* resid, int tail_n, const uint8_t* cheap) {
     if (T <= 0) return;
-    if ((tail_n > 0) != (resid != nullptr)) tail_n = 0;   // (IK2_TAIL_SKIP needs the tier's table)
+    if ((tail_n > 0) != (resid != nullptr)) tail_n = 0;   // (IK2_TAIL_SKIP needs the residency table)
+    if (!cheap) cheap = resid;
     if (K < 1 || K > kRouteMax) {
         std::fprintf(stderr, "ik2::k::route: K %d\n", K);
         std::abort();
@@ -7156,7 +7161,7 @@ void route(const float* logits, const float* bias, int T, int E, int K, float sc
         route_kernel<<<T, 128, (size_t) E * 4, s>>>(logits, bias, T, E, K, scale, top, w, rank);
         check("route");
     }
-    if (tail) tail_pass(T, E, K, scale, top, w, resid, tail_n, s);
+    if (tail) tail_pass(T, E, K, scale, top, w, resid, cheap, tail_n, s);
 }
 
 // (IK2_CACHE_BIAS's measurement: a token's router scores (sigmoid + the bias table) - their sum and sum of squares,
@@ -8131,10 +8136,11 @@ void route_gather(const int* top, const float* w, const uint8_t* const* tab, con
 void route_token(const float* logits, const float* bias, int E, int K, float scale, const uint8_t* const* tab,
                  const float* sg_t, const float* su_t, const float* sd_t, int* top, float* w, const uint8_t** blob,
                  int* tok, int* inv, float* sg, float* su, float* wt, cudaStream_t s, const float* x, int width,
-                 uint16_t* x_limbs, const uint8_t* resid, int tail_n) {
+                 uint16_t* x_limbs, const uint8_t* resid, int tail_n, const uint8_t* cheap) {
+    if (!cheap) cheap = resid;
     if (E > 1024 || K > E) {   // (more experts than a block's threads: the two kernels)
         if (x_limbs) to_f16_limbs(x, (size_t) width, x_limbs, s);
-        route(logits, bias, 1, E, K, scale, top, w, s, resid, tail_n);
+        route(logits, bias, 1, E, K, scale, top, w, s, resid, tail_n, cheap);
         route_gather(top, w, tab, sg_t, su_t, sd_t, K, K, blob, tok, inv, sg, su, wt, s);
         return;
     }
@@ -8143,7 +8149,7 @@ void route_token(const float* logits, const float* bias, int E, int K, float sca
     const unsigned blocks = 1 + (x_limbs ? (width + nt - 1) / nt : 0);
     route_token_kernel<<<blocks, nt, (size_t) (E + nt / 32 + K + 1 + K) * sizeof(float), s>>>(
         logits, bias, E, K, scale, tab, sg_t, su_t, sd_t, top, w, blob, tok, inv, sg, su, wt, x, width, x_limbs, resid,
-        tail_n);
+        tail_n, cheap);
     check("route_token");
 }
 
@@ -8482,10 +8488,11 @@ void attn_res_jobs_block(const ResStates& states, int n, const float* q, int nq,
 }
 
 void route_rows(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
-                cudaStream_t s, const uint8_t* resid, int tail_n) {
+                cudaStream_t s, const uint8_t* resid, int tail_n, const uint8_t* cheap) {
     if (T <= 0) return;
+    if (!cheap) cheap = resid;
     if (E > 1024 || K > E || K > kRouteMax) {
-        route(logits, bias, T, E, K, scale, top, w, s, resid, tail_n);
+        route(logits, bias, T, E, K, scale, top, w, s, resid, tail_n, cheap);
         return;
     }
     if ((tail_n > 0) != (resid != nullptr)) tail_n = 0;
@@ -8499,7 +8506,7 @@ void route_rows(const float* logits, const float* bias, int T, int E, int K, flo
     route_rows_kernel<<<(unsigned) T, nt, (size_t) (E + nt / 32 + K + 1 + K) * sizeof(float), s>>>(
         logits, bias, E, K, scale, top, w, rank);
     check("route_rows");
-    if (tail) tail_pass(T, E, K, scale, top, w, resid, tail_n, s);
+    if (tail) tail_pass(T, E, K, scale, top, w, resid, cheap, tail_n, s);
 }
 void experts_block_gu_q8(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
                          size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su,
