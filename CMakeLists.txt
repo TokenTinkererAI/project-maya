@@ -942,7 +942,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_library(ik2_kernels STATIC src/ik2/ik2_kernels.cu src/ik2/ik2_off.cu)
     # (third_party/ggml: ggml's IQ3_XXS grid and IQ4_XS values, src/ik2/ik2_iq_tables.h)
     target_include_directories(ik2_kernels PUBLIC ${_strata_gpu_include_directories} src/ik2 third_party/ggml)
-    target_link_libraries(ik2_kernels PUBLIC ${_strata_gpu_runtime_target})
+    target_link_libraries(ik2_kernels PUBLIC ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
     # the engine: the experts in pinned host memory, a cache of them in VRAM; one GPU, or two (IK2_EP=1 / IK2_TP=1)
     # (the offload path's CPU lane, ik2_lane.cpp: its rows in ik2_exact.h's arithmetic on maya-hy4's lane threads -
     #  hy4_lane.cpp and what it needs from maya-ds4's CPU rows, built here as maya-hy4 builds them)

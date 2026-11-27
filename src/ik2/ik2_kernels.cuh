@@ -106,6 +106,13 @@ void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint
                     int D, int Tq, int qpos0, float qk_scale, float v_inv_scale, const float* bias, int extent,
                     int window, const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats,
                     int n_split, cudaStream_t s);
+/// (IK2_PVSK) the prefill attention's PV GEMM with its K axis split: C[Tq][ld_out] += sum_j P[h][t][j] V[j][h/KV][d]
+/// at head h, fp16 operands and fp32 sums, in S k-slices - one stream a (slice, KV group), each slice into its own
+/// partial ([S][Tq][ld_out], slice stride part_stride), summed by a reducer.  S == 1 writes (accum: adds to) out.
+/// h: the caller's cublasHandle_t (null: one of its own - the test's).
+void pv_split(void* h, const uint16_t* p, long long p_head, int ld_p, const uint16_t* v, int ld_v,
+              float* out, int ld_out, float* part, long long part_stride, int Tq, int nk, int H, int KV, int D,
+              int S, bool accum, cudaStream_t s);
 /// a split count for attn_flash_f16: Tq queries x H heads against up to nk keys on n_sm SMs
 int attn_flash_splits(int Tq, int H, int nk, int n_sm);
 /// can this build run attn_flash_* on the current GPU (CUDA: always; AMD: the RDNA matrix-core kernel's archs)

@@ -7029,6 +7029,104 @@ void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uin
                                                                                  out, o_ld, 1.0f);
     check("attn_flash_combine");
 }
+
+#ifndef STRATA_USE_HIP
+#include <cublas_v2.h>
+#endif
+
+namespace {
+// (IK2_PVSK: the prefill's PV GEMM - C[t][h][d] += sum_j P[h][t][j] V[j][h/KV][d] - split over K, because cuBLAS's grid
+//  for this shape is set by M (= D = 128) and N (= Tq) alone: one launch is 3-24 blocks on a 15-SM card (13-24 warps of
+//  the 64 an SM holds) and the GEMM measures 1,484 GFLOPS, 21.7 pct of peak, against QK's 3,833 for the same FLOPs.
+//  A slice is a k-range of its own stream and its own fp32 partial; the S*KV (slice, KV group) launches run at once,
+//  then one reducer sums the S partials into the output.  Nothing else about the GEMM changes: fp16 operands, fp32
+//  sums, and the same cuBLAS kernel - only its grid is filled out.)
+__global__ void pv_reduce_kernel(float* __restrict__ out, const float* __restrict__ part, long long stride, int S,
+                                 long long n4, int accum) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n4) return;
+    float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int s = 0; s < S; ++s) {
+        const float4 t = *reinterpret_cast<const float4*>(part + (size_t) s * stride + i * 4);
+        v.x += t.x, v.y += t.y, v.z += t.z, v.w += t.w;
+    }
+    float4* o = reinterpret_cast<float4*>(out) + i;
+    if (accum) {
+        const float4 t = *o;
+        v.x += t.x, v.y += t.y, v.z += t.z, v.w += t.w;
+    }
+    *o = v;
+}
+}   // namespace
+
+void pv_split(void* h_in, const uint16_t* p, long long p_head, int ld_p, const uint16_t* v, int ld_v,
+              float* out, int ld_out, float* part, long long part_stride, int Tq, int nk, int H, int KV, int D,
+              int S, bool accum, cudaStream_t s) {
+#ifndef STRATA_USE_HIP
+    if (Tq <= 0 || nk <= 0) return;
+    const int gqa = H / KV;
+    const float one = 1.0f, zero = 0.0f;
+    cublasHandle_t h = (cublasHandle_t) h_in;
+    bool own = false;
+    if (!h) {
+        cublasCreate(&h);
+        own = true;
+    }
+    if (S <= 1) {   // (one slice: the output itself, added to what the caller's earlier k-chunks put there)
+        cublasSetStream(h, s);
+        for (int g = 0; g < KV; ++g) {
+            const float beta = accum ? one : zero;
+            cublasGemmStridedBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N, D, Tq, nk, &one, v + (size_t) g * D, CUDA_R_16F,
+                                       ld_v, 0, p + (long long) g * gqa * p_head, CUDA_R_16F, ld_p, p_head, &beta,
+                                       out + (size_t) g * gqa * D, CUDA_R_32F, ld_out, (long long) D, gqa,
+                                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        }
+        check("pv_split_s1");
+        if (own) cublasDestroy(h);
+        return;
+    }
+    // (one stream and one event a (slice, KV group): S*KV launches in flight, each its own k-range into its own partial)
+    int nst = S * KV;
+    static cudaStream_t st[64];
+    static cudaEvent_t ev[64], fork;
+    static int made = 0;
+    if (nst > 64) nst = 64;   // (S <= 8, KV <= 8)
+    if (made < nst) {
+        for (int i = made; i < nst; ++i) {
+            (void) cudaStreamCreateWithFlags(&st[i], cudaStreamNonBlocking);
+            (void) cudaEventCreateWithFlags(&ev[i], cudaEventDisableTiming);
+        }
+        if (!made) (void) cudaEventCreateWithFlags(&fork, cudaEventDisableTiming);
+        made = nst;
+    }
+    (void) cudaEventRecord(fork, s);
+    for (int i = 0; i < nst; ++i) (void) cudaStreamWaitEvent(st[i], fork, 0);
+    for (int sl = 0; sl < S; ++sl) {
+        const int ks = (int) ((long long) nk * sl / S), ke = (int) ((long long) nk * (sl + 1) / S);
+        for (int g = 0; g < KV; ++g) {
+            const int i = sl * KV + g;
+            cublasSetStream(h, st[i]);
+            cublasGemmStridedBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N, D, Tq, ke - ks, &one,
+                                       v + (size_t) g * D + (size_t) ks * ld_v, CUDA_R_16F, ld_v, 0,
+                                       p + (long long) g * gqa * p_head + ks, CUDA_R_16F, ld_p, p_head, &zero,
+                                       part + (size_t) sl * part_stride + (size_t) g * gqa * D, CUDA_R_32F, ld_out,
+                                       (long long) D, gqa, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            (void) cudaEventRecord(ev[i], st[i]);
+        }
+    }
+    cublasSetStream(h, s);
+    for (int i = 0; i < nst; ++i) (void) cudaStreamWaitEvent(s, ev[i], 0);
+    const long long n4 = (long long) Tq * ld_out / 4;
+    pv_reduce_kernel<<<(unsigned) ((n4 + 255) / 256), 256, 0, s>>>(out, part, part_stride, S, n4, accum ? 1 : 0);
+    check("pv_reduce");
+    if (own) cublasDestroy(h);
+#else
+    (void) h_in, (void) p, (void) p_head, (void) ld_p, (void) v, (void) ld_v, (void) out, (void) ld_out, (void) part;
+    (void) part_stride, (void) Tq, (void) nk, (void) H, (void) KV, (void) D, (void) S, (void) accum, (void) s;
+    std::abort();   // (the split PV is CUDA-only for now)
+#endif
+}
+
 void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint8_t* vc, int kv_cap, int H, int KV,
                     int D, int Tq, int qpos0, float qk_scale, float v_inv_scale, const float* bias, int extent,
                     int window, const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats,

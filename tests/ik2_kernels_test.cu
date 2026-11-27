@@ -3406,6 +3406,75 @@ void test_window_exact(bool mma) {
     }
 }
 
+
+// (IK2_PVSK: the prefill attention's PV GEMM with its K split across streams, at the engine's shapes - 24 heads in 8 KV
+//  groups, D 128, Tq 112, nk 2,500 - against a double reference.  fp16 operands, fp32 sums; a split changes the
+//  summation order, so this is a tolerance, not a hash.)
+void test_pv_split() {
+    const int H = 24, KV = 8, D = 128, Tq = 112, nk = 2500, S = 4, HD = H * D, KD = KV * D;
+    std::mt19937 r(20261127);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<uint16_t> p((size_t) H * Tq * nk), v((size_t) nk * KD);
+    for (auto& x : p) {
+        const __half h = __float2half_rn(nd(r));
+        std::memcpy(&x, &h, 2);
+    }
+    for (auto& x : v) {
+        const __half h = __float2half_rn(nd(r));
+        std::memcpy(&x, &h, 2);
+    }
+    uint16_t *dp = dev_n<uint16_t>(p.size()), *dv = dev_n<uint16_t>(v.size());
+    CU(cudaMemcpy(dp, p.data(), p.size() * 2, cudaMemcpyHostToDevice));
+    CU(cudaMemcpy(dv, v.data(), v.size() * 2, cudaMemcpyHostToDevice));
+    float* dout = dev_n<float>((size_t) Tq * HD);
+    float* dpart = dev_n<float>((size_t) S * 512 * HD);
+    CU(cudaMemset(dout, 0, (size_t) Tq * HD * 4));
+    k::pv_split(nullptr, dp, (long long) Tq * nk, nk, dv, KD, dout, HD, dpart, (long long) 512 * HD, Tq, nk, H, KV, D,
+                S, false, 0);
+    CU(cudaDeviceSynchronize());
+    std::vector<float> out((size_t) Tq * HD);
+    CU(cudaMemcpy(out.data(), dout, out.size() * 4, cudaMemcpyDeviceToHost));
+    const int gqa = H / KV;
+    double worst = 0.0, maxr = 0.0;
+    std::vector<double> acc(D);
+    for (int t = 0; t < Tq; ++t)
+        for (int h = 0; h < H; ++h) {
+            const int g = h / gqa;
+            std::fill(acc.begin(), acc.end(), 0.0);
+            for (int j = 0; j < nk; ++j) {
+                const uint16_t pu = p[((size_t) h * Tq + t) * nk + j];
+                const double pj = (double) __half2float(*reinterpret_cast<const __half*>(&pu));
+                const uint16_t* vr = &v[(size_t) j * KD + (size_t) g * D];
+                for (int d = 0; d < D; ++d)
+                    acc[d] += pj * (double) __half2float(*reinterpret_cast<const __half*>(&vr[d]));
+            }
+            for (int d = 0; d < D; ++d) {
+                const double got = out[(size_t) t * HD + (size_t) h * D + d];
+                worst = std::max(worst, std::fabs(got - acc[d]));
+                maxr = std::max(maxr, std::fabs(acc[d]));
+            }
+        }
+    const double rel = maxr > 0 ? worst / maxr : 0.0;
+    expect_true("pv split (K 4 ways, Tq 112, nk 2,500): within 2e-3 of the double reference", rel < 2e-3);
+    std::printf("     pv split worst |delta| %.3e against %.3e (rel %.2e)\n", worst, maxr, rel);
+    float* dout1 = dev_n<float>((size_t) Tq * HD);
+    CU(cudaMemset(dout1, 0, (size_t) Tq * HD * 4));
+    k::pv_split(nullptr, dp, (long long) Tq * nk, nk, dv, KD, dout1, HD, dpart, (long long) 512 * HD, Tq, nk, H, KV, D,
+                1, false, 0);
+    CU(cudaDeviceSynchronize());
+    std::vector<float> out1((size_t) Tq * HD);
+    CU(cudaMemcpy(out1.data(), dout1, out1.size() * 4, cudaMemcpyDeviceToHost));
+    double w1 = 0.0;
+    for (size_t i = 0; i < out.size(); ++i) w1 = std::max(w1, (double) std::fabs(out[i] - out1[i]));
+    expect_true("pv split: S=1 and S=4 agree (fp32 order's own error)", w1 / (maxr > 0 ? maxr : 1.0) < 2e-3);
+    std::printf("     pv split S=1 vs S=4 worst |delta| %.3e\n", w1);
+    CU(cudaFree(dp));
+    CU(cudaFree(dv));
+    CU(cudaFree(dout));
+    CU(cudaFree(dout1));
+    CU(cudaFree(dpart));
+}
+
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
@@ -3422,6 +3491,7 @@ int main() {
     test_conv();
     test_attn_res();
     test_attn_probs();
+    test_pv_split();
     test_route();
     test_moe_pieces();
     test_decode();

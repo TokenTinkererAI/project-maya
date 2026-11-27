@@ -424,6 +424,9 @@ inline bool dual() { return g_ep || g_tp; }
 std::vector<uint8_t> g_ep_own;
 inline int ep_owner(int l, int e) { return g_ep_own[(size_t) l * g_pop_E_ep + e]; }
 bool g_flash = true;   // IK2_FLASH=0: the prefill's attention (FP16 KV) through the logits in memory and cuBLAS, not fused
+// (IK2_PVSK=S: the prefill's PV GEMM with its K axis split S ways (k::pv_split) instead of one cuBLAS call whose grid
+//  for this shape is 3-24 blocks; S partials are summed after.  Unset or 0: the cuBLAS call, unchanged and exact.)
+int g_pv_sk = 0;
 // (IK2_SCFP16=1: the prefill attention's QK scores are stored FP16 instead of FP32.  The same buffer then holds twice as
 //  many, so the query tile the softmax / GEMM loop takes (Tq) doubles - the QK and PV products run a fuller cuBLAS tile
 //  and every touch of a score moves 2 bytes instead of 4.  The softmax still accumulates in FP32: only the stored
@@ -1496,6 +1499,7 @@ struct Work {
     float* relb = nullptr;
     int relb_ext = 0;
     uint16_t* lg16 = nullptr;   // the prefill attention's probabilities (FP16, lg_cap of them; aliases gu32)
+    float* pv_part = nullptr;   // (IK2_PVSK: [S][kRelbRows][HD] the PV K slices' fp32 partials)
     size_t gu32_bytes = 0;   // (gu32's size: a lent scratch only replaces it when it needs more)
     int T_host = 0;          // tokens the pinned host staging (pos_h, route_h, gidx_h, ..) holds
     std::vector<int> cnt, start, fill, hit_exps, miss_exps;
@@ -2088,14 +2092,22 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                     if (nk_s > W.kv_tmp_cap) {
                         unpack_kv(k0_s + k_off, nk_c);
                     }
-                    const float beta = k_off == 0 ? zero : one;
-                    for (int g = 0; g < c.KV; ++g) {
-                        const uint16_t* Vp = W.kv_v16 + (size_t) g * c.D;
-                        CB(cublasGemmStridedBatchedEx(
-                            g_blas, CUBLAS_OP_N, CUBLAS_OP_N, c.D, Tq, nk_c, &one, Vp, CUDA_R_16F, KD, 0,
-                            lg16 + (size_t) g * GQA * qn + k_off, CUDA_R_16F, nk_s, qn, &beta,
-                            W.o + (size_t) ts * HD + (size_t) g * GQA * c.D, CUDA_R_32F, HD, (long long) c.D, GQA,
-                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+                    if (g_pv_sk > 0 && W.pv_part) {
+                        // (IK2_PVSK: the PV GEMM with its K split g_pv_sk ways - see k::pv_split.  The chunk's P and V
+                        //  are the ones just staged; k_off rides in the P pointer, the V staging restarts at 0.)
+                        k::pv_split((void*) g_blas, lg16 + (size_t) k_off, (long long) qn, nk_s, W.kv_v16, KD,
+                                    W.o + (size_t) ts * HD, HD, W.pv_part, (long long) Work::kRelbRows * HD, Tq,
+                                    nk_c, c.H, c.KV, c.D, g_pv_sk, k_off != 0, g_s);
+                    } else {
+                        const float beta = k_off == 0 ? zero : one;
+                        for (int g = 0; g < c.KV; ++g) {
+                            const uint16_t* Vp = W.kv_v16 + (size_t) g * c.D;
+                            CB(cublasGemmStridedBatchedEx(
+                                g_blas, CUBLAS_OP_N, CUBLAS_OP_N, c.D, Tq, nk_c, &one, Vp, CUDA_R_16F, KD, 0,
+                                lg16 + (size_t) g * GQA * qn + k_off, CUDA_R_16F, nk_s, qn, &beta,
+                                W.o + (size_t) ts * HD + (size_t) g * GQA * c.D, CUDA_R_32F, HD, (long long) c.D, GQA,
+                                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+                        }
                     }
                 }
             } else {
@@ -5798,6 +5810,7 @@ int main(int argc, char** argv) {
     g_lookup = drafting != "off" && !(getenv("IK2_LOOKUP") && !std::atoi(getenv("IK2_LOOKUP")));
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
+    if (const char* pv = getenv("IK2_PVSK")) g_pv_sk = std::clamp(std::atoi(pv), 0, 8);
     g_scfp16 = getenv("IK2_SCFP16") && std::atoi(getenv("IK2_SCFP16"));
     g_scfp16_log = getenv("IK2_SCFP16_LOG") != nullptr;
     if (const char* mb = getenv("IK2_SC_MB")) {   // (IK2_SC512=1: the same thing at 512 MiB, the old switch)
@@ -6591,6 +6604,9 @@ int main(int argc, char** argv) {
                     g_lg_bytes ? " + IK2_SC_MB sized" : "", (double) (cap * esz) / 1048576.0, cap,
                     (double) (cap * 2) / 1048576.0,
                     std::max<size_t>(1, cap / ((size_t) c.H * (size_t) ctx)), ctx);
+        if (g_pv_sk > 0)
+            std::printf("pv split: the prefill's PV GEMM with K split %d ways (IK2_PVSK), %.1f MiB of fp32 partials\n",
+                        g_pv_sk, (double) g_pv_sk * Work::kRelbRows * (double) (c.H * c.D) * 4.0 / 1048576.0);
         std::fflush(stdout);
     }
     size_t fr = 0, tot = 0;
@@ -6921,6 +6937,8 @@ int main(int argc, char** argv) {
             W.kv_w8v = dalloc<uint8_t>((size_t) W.Tm * KD);
         }
         W.kv_v16 = dalloc<uint16_t>((size_t) W.kv_tmp_cap * KD);
+        if (g_pv_sk > 0)   // (IK2_PVSK: the K slices' fp32 partials - S x 512 rows x HD)
+            W.pv_part = dalloc<float>((size_t) g_pv_sk * Work::kRelbRows * (size_t) HD);
     }
     W.pos = dalloc<int>(T_buf);
     W.rlog = dalloc<float>(T_buf * c.E), W.route_d = dalloc<int>(S_buf * 2);
