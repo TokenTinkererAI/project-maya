@@ -702,3 +702,470 @@ End-to-end after both (real socket close, not a pooled connection): next request
 - The diag lane's own reproduction used `requests`' `r.close()`, which returns the connection to a pool instead of closing it: the server never saw a FIN, so its 26 s "next request waits" was partly harness artefact. A real socket close showed the same shape but with the 10 s queue wait as the dominant term; the fix closes both.
 - Ordering confound: the multi-turn arms ran one after another on a warming box (46-49 C at start), so absolute levels differ between arms; clocks were pinned at 1935 MHz throughout, so the trend does not.
 - ik2 prints no expert-cache hit/miss counters to the server (`_parse_stat` at `serve/server.py:1709-1710` only understands GLM `STAT` lines), so the tier was excluded indirectly, not measured.
+### Lab moved to ik2-tuned @ a666e9d (2026-11-25, user: "replace the lab maya version with our latest push")
+
+- Lab repo checkout: branch `lab-latest` at `a666e9da` (fetched from a bundle of the fork tip). Previous branch `lab-tier0` @ `ea70aa37` preserved as `lab-before-ik2tuned`; previous binary preserved as `build/maya-ik2.lab-tier0` (md5 4e30318b). Server stopped with SIGTERM (port freed, 0 engine procs).
+- Build: `cmake --build build --target maya-ik2 ik2_kernels_test` exit 0 -> build/maya-ik2 25,306,888 B, md5 a6e2d666. `ik2_kernels_test`: all passed (incl. KV4 codec cases).
+- Config `maya-inkling-2-mini-lab.json` gained `IK2_E4LUT=0` (backup `.bak-before-ik2tuned`): the new tree defaults E4LUT ON and that lever measured -4 pct on sm_61. Explicit env wins, so the card keeps its setting.
+- PAIRED A/B (6 interleaved rounds, live env + E4LUT=0, 65-id prompt, --gen 256, 131072):
+  - old (lab-tier0 binary): 18.09 / 18.03 / 18.14 / 18.09 / 18.27 / 18.00 -> median **18.09**
+  - new (a666e9d): 17.46 / 17.48 / 17.52 / 17.54 / 17.53 / 17.54 -> median **17.53 = -3.1 pct**
+  - Expert tier identical in both arms (709 vs 708 of 3072, 2.8 GiB). Misses collapse on the new binary (4,463 vs 20,305 per run: the cache-bias 0.15 default working), yet decode is SLOWER: the Ampere-shaped kernel delta costs more on sm_61 than the router gains save. Same shape as the tier-0 wholesale-merge attempt (-6.1 pct); the surgical port remains the fastest lab binary.
+- Server restarted on the new binary (setsid/nohup, ready in 27 s, /v1/models 200): banner `thinking level when a request names none: low`, ready line `images on`; live request `17*23` -> '391', 60 completion tokens, thinking 26/47 of 256 at 17.9-19.0 tok/s served.
+- Decision left to the user: keep the latest tree (-3.1 pct decode, plus cache-bias/tail-skip quality trade unmeasured on the lab) or restore `lab-tier0` (copy `build/maya-ik2.lab-tier0` back over `build/maya-ik2`, or `git checkout lab-before-ik2tuned` and rebuild).
+- The read-only ISA audit lane was cancelled on the user's order before producing any SASS data.
+### Lab cross-layer prefetch (IK2_XPF): built, gated, DROPPED (2026-11-25, user asked to spend the idle link)
+
+- Attempt: 3 files, +412 lines (`src/ik2/ik2_off.cuh` +18, `ik2_off.cu` +110, `ik2_main.cu` +284) â€” profile-ranked plan kernel, staging-only copies on `g_cs`, producer/consumer hooks. Default-off byte-identical PASS (8/8 `generated:` lines identical; `--score` both 511 positions mean NLL 2.855532, PPL 17.3837). Reverted; saved on the lab as `/tmp/xpf-attempt.patch`; `lab-pf` has zero commits.
+- ON mode crashed: `cudaStreamSynchronize(g_s): illegal memory access` â€” experts with `nopin[e]` have no bytes in the pinned base (they live only in the file mapping `Ly.fh`), so the copy dereferenced unregistered pages.
+- Measured (graph token path only; POP_OUT unset, CPU_FRAC=0, because the live path cannot run XPF), one run each, gen 39:
+
+| arm | tok/s | link traffic | prefetch copies | staging share of picks |
+|---|---|---|---|---|
+| control | 11.52 | 70.3 MiB/token | â€” | 4.2 pct |
+| IK2_XPF=8 | 4.88 | 1534.6 MiB/token | 354.1/token | 1.7 pct |
+| IK2_XPF=16 | 4.42 | 1789.1 MiB/token | 422.9/token | 1.8 pct |
+
+- WHY: 48 visits x 8 experts x ~3.9 MiB = ~1.5 GiB/token, 22x the control's traffic; the static profile's top-non-resident ranking hit the actual picks only ~2 pct of the time. The idle-link budget is ~18 ms/token which at ~0.63 ms/expert is ~28 experts/token = **0.6 per visit** â€” N=8 is 13x over budget, so even a perfect predictor could not fit.
+- STRUCTURAL FINDINGS worth keeping: (1) `IK2_DF` (decode prefetch, staging-only, non-blocking) exists and is DEAD under every live config â€” `forward()` routes T=1 to `fast_token()` only if `(g_fast||g_off) && T==1 && g_pop.empty() && g_cpu_frac <= 0`, and the live config sets both `IK2_POP_OUT` and `IK2_CPU_FRAC=0.5`, so decode runs the host token path which fetches each miss with `EC.get()` and uses no staging ring. (2) The profile format is usable: `int32 n_layer, int32 E, uint64 counts[n_layer*E]` (24 x 128 here), already read by `IK2_WARM`. (3) Reviving prefetch would need: hook the `g_mv` host token path, never copy `nopin[e]` experts through the pinned base, and cap by a bytes budget (<=1 expert/visit).
+- Lab restored: `build/maya-ik2` rebuilt from `a666e9d`, kernels test all passed, server up, `/v1/models` 200.
+### Lab CPU_FRAC sweep 0.5 -> 1.0 (2026-11-25, user directive "sweep cpu frac from 0.5 to 1")
+
+Six arms (0.5/0.6/0.7/0.8/0.9/1.0), 6 rotated interleaved rounds, gen 256 at 131072, 208-token prompt, live env + IK2_E4LUT=0, ON the live binary (/home/lab/maya/build/maya-ik2, md5 f0543cbb, build-id 16d34d5b...; byte-twin of a6e2d666 apart from .strtab nvcc temp names).
+
+| arm | median tok/s | paired d vs 0.5 | median misses |
+|---|---|---|---|
+| 0.5 | 17.480 | - | 3,970 |
+| 0.6 | 17.530 | +0.48 pct | 4,124 |
+| 0.7 | 17.535 | +0.60 pct | 4,198 |
+| 0.8 | 17.520 | +0.50 pct | 4,210 |
+| 0.9 | 17.595 | +0.97 pct | 4,754 |
+| 1.0 | 18.335 | +5.21 pct | 13,883 |
+
+Confirm (3 extra interleaved with 0.5): 1.0 = 18.34/18.33/18.30, 0.5 = 17.47/17.52/17.49 -> paired +4.98/+4.62/+4.63 pct. Combined n=9: 0.5 17.48, 1.0 18.33, +4.86 pct median (orchestrator-verified from the raw generation lines: 1.0 min 18.29 > 0.5 max 17.52, no overlap). 0 deaths, 0 reruns.
+
+DROUTE (gen 32): at 0.5 the lane is cap-bound (share == cap 0.50) and CPU-queue-bound per visit (0.28 vs 0.03 ms); at 0.7 the link limits (0.30 vs 0.37); at 1.0 the D2H/link term collapses to 0.00 and the lane takes every miss (2.55 experts/visit) with lane wait 0.204 ms/visit (total 1.88 ms over 2.88 s - not wall-saturated, simply no longer waiting on the link). Mechanism: intermediate fractions leave the CPU idle half the time; only ownership of all misses pays.
+
+Costs: cache misses triples (3.9k -> 13.9k) because the lane absorbs them - that is the mechanism, not a regression. Output is NOT bit-identical across fractions (different experts computed on CPU vs GPU, different accumulation order), so any change needs the --score gate, not a hash gate.
+
+Downtime 29 m 07 s (SIGTERM 14:15:47, stopped 14:16:38, ready 14:45:45); config left at 0.5 for the caller to move; server healthy on the unchanged config afterwards.
+### CPU-lane gate: the +4.9 pct is lossless, but the cache bias steers by a stale table (2026-11-25, lab)
+
+Ladder on lab HEAD a666e9d, 512-id score file, --chunk 1, 511 positions, live env + IK2_E4LUT=0:
+
+| knobs (bias/tail) | CPU_FRAC | mean NLL | PPL | misses | top-1 div vs same-knobs 0.5 |
+|---|---|---|---|---|---|
+| 0.15 / 4 | 0.5 | 2.884912 | 17.9020 | 6,089 | - |
+| 0.15 / 4 | 1.0 | 3.029286 | 20.6825 | 32,858 | 107/511 (20.9 pct) |
+| 0.15 / 4 | 0.5 (repeat) | 2.916454 | 18.4757 | 6,023 | - |
+| 0.15 / 4 | 1.0 (repeat) | 3.029286 | 20.6825 | 32,858 | 108/511 (21.1 pct) |
+| 0 / 0 | 0.5 | 2.844982 | 17.2013 | 34,738 | - |
+| 0 / 0 | 1.0 | 2.847839 | 17.2505 | 80,705 | 63/511 (12.3 pct) |
+
+- Routing-neutral gap: +0.002857 (n pair) and -0.009054 (r pair) => a tie. The CPU lane's arithmetic is NOT lossy at this resolution, and 1.0 is exactly reproducible (3.029286 twice, identical 32,858 misses) whereas 0.5 drifted (2.8849 vs 2.9165).
+- Default-knob gap: +0.144374 then +0.112832 => systematic, not drift. Flipped tokens carry mean lp delta -0.193 (degradation of the true token) in the default arms vs symmetric +0.043/-0.042 noise in the neutral arms.
+- **DEFECT FOUND**: at CPU_FRAC=1.0 a CPU-lane miss never takes a VRAM slot (ik2_main.cu:4799-4805: `++EC.misses; where[i]=nullptr`; only the urgent/lazy branches call EC.get/copy_in), so `IK2_CACHE_BIAS` reads the resident table as "cheap to compute" while it is really "resident, not necessarily cheap" - the bias then steers the router toward stale residents, and `IK2_TAIL_SKIP` drops non-resident picks that the lane would have computed for free. Same defect shape exists at Windows' 0.5, where the lane serves part of the misses.
+- Accounting sanity: hits+misses = 196,608 (48 visits x 512 tokens x 8 experts) in every arm; `score cache: 0.00 GiB copied` at 1.0 is correct, not a broken counter - a lane-served miss never calls copy_in.
+- DECISION (user, 2026-11-25): "Lab: 1.0 with the bias off today" - no code change; lab config gets IK2_CPU_FRAC=1.0 + IK2_CACHE_BIAS=0, tail chosen by a 1.0 bias-off tail-4-vs-0 score pair.
+- The proper fix (not commissioned): bias/tail predicates should test "cheap to compute" (resident OR lane-served), not "resident".
+
+
+### Lab: the four corners of CPU_FRAC x cache bias (2026-11-25, lab, binary a666e9d)
+
+The shipped CPU_FRAC=1.0/bias0/tail0 config measured 16.2 tok/s against 18.33 for the arm it was derived from, so the four corners were run: 6 rotated interleaved rounds, `--gen 256`, prompt = first 32 ids of hill-climb/prefill-tokens-512.txt, `--max-context 131072`, live env + IK2_E4LUT=0, IK2_POP_OUT=data/expert-profile-live.bin. All 24 runs rc=0.
+
+| arm | CPU_FRAC | IK2_CACHE_BIAS | IK2_TAIL_SKIP | median tok/s | median misses | vs A |
+|---|---|---|---|---|---|---|
+| A (old live) | 0.5 | 0.15 | 4 | 18.010 | 4,608 | - |
+| B (shipped) | 1.0 | 0 | 0 | 16.275 | 38,478 | -9.6 pct |
+| C | 1.0 | 0.15 | 0 | 17.780 | 26,600 | -1.3 pct |
+| D | 1.0 | 0.15 | 4 | 18.785 | 16,618 | +4.3 pct |
+
+- Absolute values sit ~+0.5 tok/s above the earlier 18.33/17.48 pair (shorter prompt), so all four are RELATIVE-only; D/A = +4.30 pct reproduces the reference +4.86 pct in direction and size. B and C are bit-identical across rounds (misses constant), A varies 2,190-5,005.
+- MECHANISM (DROUTE, --gen 32, 1,536 visits): A lane 1.25 experts/visit, queue 0.32 ms vs link 0.41 ms (link-bound), lane wait 0.048 ms/visit. B lane 5.47 experts/visit, queue 0.93 ms vs link 0.00 ms, lane wait 0.537 ms/visit (11x A). So with the bias OFF the CPU lane becomes the per-visit critical path; the +4.9 pct of CPU_FRAC 1.0 only exists when a steering knob keeps the lane small (D/A), which is the same knob defect that costs quality (+0.14 NLL, 21 pct top-1 flips at 1.0).
+- The lossless route (not taken): IK2_LANE_THREADS scaling, so the lane can carry the full miss volume without steering.
+- DECISION (user): revert the lab to arm A and stop lab tuning. Config back to IK2_CPU_FRAC=0.5 with no IK2_CACHE_BIAS / IK2_TAIL_SKIP keys (code defaults 0.15 / 4 in force); restarted and verified.
+- Downtime for the 4-arm sweep: ~18 m 36 s (SIGTERM 14:12:09Z -> /v1/models 200 14:30:45Z).
+### PolyStrata on the lab: closed by inspection of its own decode (2026-11-26, user verdict)
+
+- Fresh clone `/home/lab/poly-v2` (simplexai-labs/PolyStrata, 205 MB) with the Inkling docs read; the plan was setup.sh --family inkling reusing the local UD-Q3_K_XL GGUF (--custom-gguf), the CUDA 12 / sm_61 engine, --kv q8_0 (fp8 needs Ampere+), and a lossless-defaults vs lossy-small-card A/B against Maya arm A (18.01 tok/s CLI, 19.1 served, prefill 87.4 tok/s at 102K).
+- The build/install lane was dispatched and then cancelled: PolyStrata's decode on this GTX 1070 with Inkling-2-Mini is much slower than Maya's. No numbers recorded beyond that verdict; nothing was installed into the lab config, and no PolyStrata work is commissioned.
+- Lab state confirmed after the stop: no strata/poly processes, VRAM 9 MiB used / 8,096 free, port 8095 free, Maya server intentionally down. Only the pre-existing `/usr/local/bin/strata-oc-watch.sh` (pid 5244, memory-clock watchdog) and the socat bridge on 8081 remain. `/home/lab/maya` untouched (arm A: CPU_FRAC 0.5 + defaults bias 0.15 / tail 4, E4LUT=0, KV fp8, CCACHE/XGLOBAL/KVLEND/ELASTIC/DECAY on).
+
+### Lab ISA audit of the attention loops (2026-11-26, read-only, sm_61 / GTX 1070)
+
+Method: no build, no bench, no server change. `cuobjdump -sass` (CUDA 12.8 at /opt/cuda-12.8; the default /opt/cuda is 13.4 and cannot disassemble sm_61) over the existing `build/maya-ik2` of `lab-tier0` @ ea70aa37, landed with `nsys stats` on the existing 23 Nov capture, plus GGUF metadata and code reads.
+
+Card measured (nsys TARGET_INFO_GPU, not spec sheets): **15 SMs** (not 20), 1.7845 GHz at capture, DRAM 256.256 GB/s, 65,536 regs/SM, 64 warps/SM, **48 KB max dynamic smem/block opt-in**. Peak FP32 6.85 TFLOPS, issue capacity 1.14e11 warp-instr/s.
+
+**Finding 1 - the 947.6 s prefill attention runs no in-tree MMA kernel.** `attn_flash_f16_kernel` is gated off on Pascal (`if (cls < 80) g_flash = false`, main.cu:6060) AND cannot launch there anyway: kFaSmem = 88,064 B (kernels.cu:1227) against the 48 KB opt-in cap; it is compiled with REG:255 and STACK:1200 (spills) and never runs. The real path (main.cu:1850-1935) is: `unpack_kv_fp8_to_f16_vec4` -> cuBLAS `maxwell_sgemm_fp16_128x32_tn` for QK^T (m=nk, n=Tq, k=128, batch=3) -> a bias GEMM (`splitKreduce_kernel`) -> `attn_probs_bias_f16_kernel` softmax (global-memory pass) -> cuBLAS for PV. At 102K the query tile collapses: `Tq = lg_cap/(H*nk_ub) = 28.36e6/(24*102020) = 11` (144 at 8K), because the 256-query refill wants 3.2 GB and `lg_bytes >= avail` refuses it beside the 2.8 GiB expert pools (main.cu:4839-4856). So the dots are **n=11 skinny GEMMs, ~1.2 M launches**: 947.63 s / 102,020 tok = 296 GFLOPS = **4.3 pct of peak** (8K: 417 GFLOPS, 1.08 ms/token). The growth is ~T^2 work, not a cliff.
+Dead on sm_61: `wgmma` (SM90-only, else __trap), `mma884` (only reached by attn_decode_v70 / attn_split), the flash kernel. Live: `mma16816`'s <700 branch (32 SHFL + 64 FFMA + 32 half2->float2 per m16n8k16) = the decode hot path, and `attn_probs_bias_f16` (prefill softmax).
+
+**Finding 2 - decode attention IS an ISA problem, and it is issue-bound, not FMA-bound.** `attn_decode_mma_kernel<uint8_t>` (kernels.cu:1608-1798, launched grid (Hkv=8, n_split=7), block 128, smem 0, REG:128, launch_bounds(128,4) => 16 warps/SM). SASS of the per-step loop = 4,026 instructions per 16-key step: FFMA 1,140 (28.3 pct), F2F.F32.F16 800 (19.9 pct), int/addr/PRMT/LOP3 1,674 (41.6 pct), SHFL.IDX 404 (10.0 pct), LDG 77, misc 117 = **251.6 instructions per key per lane for 8 useful FMAs**. Work = 8 full visits x 8 KV heads x 102,020 keys = 6.53e6 key-units => 1.64e9 warp-instr => 14.4 ms at 100 pct issue; measured ~33 ms (44 pct of issue peak) vs a 6.5 ms DRAM floor. Waste source: m16n8k16's n=8 columns against R=3 heads, plus 50 F2F and 25 SHFL per key.
+
+Geometry confirmed: head_count 24, head_count_kv 8 (GQA=3), head_dim 128, sliding_window 1024 every 6th layer => 24 layers, 20 sliding, 4 full, looped 6..17 x3 = 48 visits. KV = FP8 E4M3 with **one fp32 scale per row (per token per KV head)**, folded at store (store_k_warp, kernels.cu:327-378) and consumed via the e4m3x4_h4 bit trick (kernels.cu:1187-1202) with sc = qk_scale*log2e (main.cu:2664-2666) - not per-32, not per-tensor.
+
+Priced (none commissioned; user deferred A2):
+- A1 (1-2 d): hoist pointers/bias addressing, fold kv_cap wrap out of the step, keep uint4 fp8 loads -> ~1.1x.
+- A2 (1-2 w, lossless): stop emulating m16n8k16 - pack 2 KV heads/warp so all 8 columns carry heads (3+3), or a 4-FFMA dot + 5-SHFL reduce per key-head. Per-key stream ~40 instr => issue floor 2.3 ms, DRAM 6.5 ms binds: attention 33 -> 7-9 ms, token 67.4 -> 42-45 ms (**1.5-1.6x**), same fp8 values with fp32 accumulation.
+- A3 (1 d): regs 128 -> 96 for 24 warps/SM; only pays after A2.
+- B (2-4 w, LOSSY, needs authorisation): int8 DP4A for QK+PV (~35-40 instr/key) => 3-5x on the stage, token ~30-35 ms; needs per-32 fp32 KV scales (+12.5 pct bytes) since the per-row fp8 scale is too coarse for int8 symmetry; QK error ~0.3-0.6 pct, PV on P in [0,1] is the sensitive part.
+- Prefill structural (unpriced): sm_61-native fused kernel at <=48 KB smem, or a query-tiling scheme that fits the logits scratch beside the expert pools.
+Not proposed by design: cp.async (absent on Pascal; the plain-copy emulation at kernels.cu:974 buys nothing) and half2/HFMA2 (1/64 rate on sm_61).
+Missing measurement: a one-shot `ncu --set full` over a 102K prefill (none exists; attribution came from the code path plus 8K->102K scaling).
+
+### Lab API "returns nothing": a 104k-token prompt against a 300 s client timeout (2026-11-26)
+
+Symptom: API requests produced nothing while short chat worked. The server was healthy throughout (8095, `/v1/models` 200, engine pid 987148) - this was not a port or process fault.
+
+Evidence from `/home/lab/maya/server-relaunch.log`:
+- `reading the prompt: 104,358 tokens` started at 19:06:25, 19:11:30, 19:16:35, 19:21:41, 19:26:46, ... - six attempts, each exactly ~305 s apart, each ending `done: 0 tokens in 305 s (0.0 tok/s) (cancel, cancel=True)`. That is a 300 s client timeout plus automatic retry.
+- Same window, sizes and prefill line counts (1 line/s): 76,521 tokens -> 281 s; 82,511 -> 320 s; 82,783 -> 773 s; 104,358 -> 1,743 s of logged progress before cancel. One 82,783 attempt was still reading at 186 s when `cancel=True` landed at 198 s.
+- Every request that completed in the same window was short: `60 tokens in 4 s`, `16 in 2 s`, `32 in 2 s`, `106 tokens in 6 s (18.0 tok/s) (stop)`.
+
+Arithmetic: measured prefill is 87.4 tok/s at 102K, so 104,358 tokens needs ~20 minutes (1,167 s measured for a 102,020-token document) against a 300 s budget. The call cannot succeed as configured.
+
+Compounding factor: a cancelled prefill saves no prefix snapshot, so each retry repeats the whole read from zero - a livelock that also pins the GPU indefinitely (the six retries burned ~30 minutes of card time producing nothing).
+
+Second trap found on Windows in the same investigation: `max_tokens` covers the thinking block too. An 18,930-token prompt with `max_tokens 48` used all 48 on reasoning and returned empty `content` while the engine logged a perfectly successful `done: 48 tokens in 27 s (18.4 tok/s)`.
+
+Resolution (user's choice): raise the API client's timeout above ~25 minutes for this endpoint; do not cancel mid-read; give `max_tokens` room for thinking plus answer. The engine and config are unchanged.
+
+### Lab VM headroom: IK2_ROOM_MB 64 -> 256 (2026-11-26, user request "let a bit more of vram headroom on the lab , like free 256mb")
+
+- Edit: `maya-inkling-2-mini-lab.json` live env block `IK2_ROOM_MB` "64" -> "256" (backup `maya-inkling-2-mini-lab.json.bak-room256`); `installer.as_set_up.env` deliberately left at 64 because that block is the historical record of what setup.py wrote, not live config.
+- Verified from `/proc/<engine>/environ`: `IK2_ROOM_MB=256`, `IK2_CPU_FRAC=0.5`.
+- Effect: idle VRAM free 24 MiB -> 214 MiB (nvidia-smi used 7,891 of 8,192; the rest is driver overhead). Tier loses roughly 36 expert slots of ~709.
+- No speed cost measured: quick prompt wall 1.234 s before and 1.234 s after; a 160-token answer served at 18.5 tok/s (inside the usual 17.5-19.5 band).
+- Restart used the standard setsid/nohup recipe, ready in 24 s, server pid 1004969, engine pid 1004984.
+
+### A2 decode rewrite, attempt 1: lossless, but aimed at a kernel this box never launches (2026-11-26, lab)
+
+Built as specified on branch `lab-a2` (commit `b0c04bf`, off `lab-latest` @ a666e9d), +185/-2 in `src/ik2/ik2_kernels.cu`: `attn_decode_at2_kernel<KVT,R>` - 16 lanes a key, 8 dims a lane, K/V read and converted once and shared by all R heads, 4-step `shfl_xor` tree, bias element riding the same tree, a warp = 2 keys with independent halves merged at the end, fp32 accumulation over the same fp8 values. Gated `IK2_AT2=1`, default off.
+
+Gates all passed: build + `ik2_kernels_test` (AT2 is MORE accurate than the emulation against the test's double reference: worst error 0.00 of tolerance vs 0.03-0.07); default-off identity byte-exact (greedy sha `9cda1c2eaccc3833`, score payload sha `42b67b08d405bd32`, NLL 2.863027); ON-mode identical to 0.000000 (0 of 511 top-1 divergences).
+
+Speed: 17.49 -> 17.50 tok/s (+0.03 pct) on the live env, 11.54 -> 11.54 with CPU_FRAC=0, prefill untouched (314.9 vs 314.5).
+
+WHY IT IS INERT (the finding that matters): nsys at 8192 ctx shows decode attention is `attn_split_kernel<u8>` - 2,256 instances x 382 us = 18.3 ms/token - and `attn_decode_mma`/`v70`/`at2` appear in NO trace. The fast token path (the only caller of `attn_decode_mma_fp8`) requires `g_pop.empty()`, i.e. `IK2_POP_OUT` unset, and without POP_OUT the model OOMs at load (11.4 GiB of experts on 8 GiB). The live config therefore always runs the host token path with the scalar split attention. The audit's 251.6 instr/key/lane was real (SASS reproduced) but described the wrong kernel: `mma<u8>` 251.6 instr/key (14.4 ms floor), `v70<u8>` 134.5 (7.7 ms), new `at2` 171.5 (9.8 ms).
+
+Also found: any CLI prompt above 8192 illegal-accesses at `ik2_main.cu:4416` - pre-existing, reproduces on the pre-change binary at 10k/12k/16k/22k and regardless of ROOM 64/256, KVLEND, ELASTIC. The server's chunked path is unaffected (26,668-token requests have completed).
+
+Next: the same rewrite aimed at `attn_split_kernel` behind `IK2_AT2S` (dispatch 2026-11-26), which is 49 pct of the deep decode token.
+### Long-prompt illegal access: a tail-skip fill slot counted as a row (2026-11-26, lab, branch lab-a2)
+
+NOT the cross-stream KV-lending hazard the earlier arms suggested. Fault: a plain out-of-bounds write in the MoE row bookkeeping.
+
+Mechanism (proved): tail_apply_kernel gives a left-out slot, at weight 0, an expert the same token already picked ("lowest resident kept expert" = a popular one). run_prefill_moe counted an expert's rows by SLOT and documented cnt_e <= T, while the expert scratch ex16/h16/y32 is [T] (a row is a token). When the fill expert is picked by every token, cnt_e = T + #fills (measured 4329 picks over 4096 tokens, 225 zero-weight slots), so gather_f16_16_kernel writes cnt_e rows past the end; the sticky error surfaces at the next cudaStreamSynchronize(g_s) in the routing D2H (main.cu:4425), which read as idle-wedge. The duplicate row also raced its own token's row in scatter_add_rows (non-atomic +=).
+
+Repro is PASS length, not prompt length: CLI --tokens 9000 faults at --chunk 4096 and 8192 (every time) but passes at 3072/3584/2048; 22067 @ chunk 2048 passed while 22067 @ 4096 faulted. CUDA_LAUNCH_BLOCKING=1 still faults (constant OOB, not a race); KVLEND/ELASTIC/OVERLAP/FLASH off all still fault. compute-sanitizer memcheck gave no kernel report (only the API illegal-address at the sync) - the signature of an OOB write into another allocation; a temporary per-phase sync trace then localised it (visit 29, MoE phase, T=4096).
+
+Fix (commit f5d3f2b on lab-a2, +18/-3 in src/ik2/ik2_main.cu): a repeated slot shares its pick's row (inv[i]=inv[i-1]) and adds its 0 weight into that row's (wtr[row] += wt[i]), so cnt[e] counts one row per (expert, token) again and the [T] scratch invariant holds. No buffer, launch or VRAM change; nothing changes when nothing is left out. Pre-fix binary kept at build/maya-ik2.prekvfix.
+
+Gates: build clean, ik2_kernels_test all passed. CLI post-fix rc=0 for 9000@4096, 9000@8192, 12000@8192, 22067@4096, 22067@2048, 9000@4096 with IK2_TAIL_SKIP=7; generated ids identical to the pre-fix chunk-2048 runs. Identity pre vs post binary: greedy 40 tok sha de1aa7dbdeb2be5a (3 reps each), --score --chunk 1 over 512 ids payload sha 1c874e32e7023ab4 / mean NLL 2.754963 (2 reps each) - byte-identical. Server (live env, IK2_AT2S=1, config md5 1c89a63d unchanged): 22,093 x3 clean (prefill 81.6/83.1/82.9 s, 64.3/64.4/70.4 ms/tok, 15.56/15.53/14.20 tok/s), 26,426 clean (104.9 s, 66.0 ms/tok, 15.16 tok/s), 20,633 clean (77.5 s, 64.8 ms/tok, 15.42 tok/s), /v1/models 200 after each, engine never restarted.
+
+Deviations: no pre/post A/B of the SERVER failure - the OOB is proven real, deterministic and gone, but "the server's probabilistic 22k failure is this bug" is inference (the server runs --chunk 2048, where one fill on an expert already at cnt=T can just cross the boundary - which also explains why KVLEND/ELASTIC off changed residency and made it vanish). CUDA_LAUNCH_BLOCKING=1 did NOT silence the CLI fault (the earlier report said it did); the launch it names (swiglu_cap_f32) is one step after the culprit.
+
+New observation, untouched: a short completion issued right after the 20.6k requests (cached_tokens = its whole prompt) answered with reasoning that quoted the PREVIOUS 20.6k prompt ("Chapter 5505, opening note 505531") - a possible snapshot-restore state leak; a fresh uncached short prompt answers correctly.\n\nDowntime 64 min 22 s (15:45:36 -> 16:49:58 local), server left UP on 8095 with the live config.\n
+### Prefix cache restored state from the wrong conversation (2026-11-26, lab, branch lab-a2, commit 3846c36)
+
+- Symptom (user-visible): a short prompt with `cached_tokens` equal to its whole self was answered with reasoning that quoted the PREVIOUS long prompt. Silent wrong output on the served path; a long prompt repeated after another long prompt could be answered as the other one (20,622-token prompt given back "Chapter 1101, opening" from the 22,082-token prompt).
+- Reproduction 3/3, order-dependent: long -> short -> short (probe/B: short long short) and long-A -> long-B -> long-A all fail; long -> single short cannot (no snapshot yet). C2 proved caching itself works (repeated 20,622-token prompt: cached 20622 in 0.2 s). Corruption tracks the most recent prompt, not the requested one.
+- Mechanism: `struct Snap` (ik2_main.cu ~7285-7295) holds the 4 convs (h, 48 visits) and the sliding layers' KV windows only - a FULL layer's K/V is never snapshotted ("positions rewrite cleanly", ~7284). A restore SKIPS the snapshot's whole prefix, so full-layer rows keep whatever prompt last wrote them. Rung 1a matched the snapshot by the snapshot's OWN ids and resumed at its `pos`; it never consulted `hist`, the engine's record of which tokens the state actually holds. Result: convs from the request's snapshot, full-layer K/V from another conversation. One 8-slot Snap ring is shared across requests by design (`reset()` keeps snapshots when `g_ccache`) and `pos` is reset per request (~7729-7737) - the ring is not the bug.
+- Fix (3846c36, +15/-5, one file): the state match is hoisted into `state_match()` and the true common prefix `L` of `hist` and the request is computed BEFORE the CCACHE block; the rung-1a candidate filter is now `s2.pos > L` (:7632) instead of `s2.pos > ids.size()`, and `state_match()` is re-run after a restore so `L` is the restored prefix. Everything inside `[0, L)` is the request's own on every layer; the existing snapshot path already worked under exactly that invariant.
+- Cost, stated plainly: returning to an OLDER conversation no longer resumes from its snapshot - it prefills (D3: 83 s instead of 5.9 s with a wrong answer). The agent-turn flow (same conversation, prompt extended) is untouched (it never needed a restore; `hist` covers it). The sound way back is snapshotting full-layer rows (~80 MB per 20k-token prefix here), a separate VRAM-budgeted change, not a guard.
+- Gates: build clean, `ik2_kernels_test` all passed. Non-cache identity unchanged (greedy sha `de1aa7dbdeb2be5a`, score payload sha `1c874e32e7023ab4`, NLL 2.754963). Cache correctness after the fix: B3/B4, C3/C5 all `cached=0` -> `content='OK'`, no mention of the long prompt; D3 `cached=0` -> full 20,622-token prefill and reasons about A's own content. Engine-level (`--serve` GEN lines, CPU_FRAC=0, 200-token prompts): A,A,B,A,A -> restores logged only where sound (`restored the snapshot at 200 ... (state held 200)`), and A1==A2==A3==A4 token-for-token. Caching still works: repeated 20,622-token prompt `cached=20622`, HTTP prefill 0.0 ms, TTFT 0.2 s vs 77.5 s fresh. Served speed: fresh long prefill 76.6 s pre / 77.5 s post, decode 21.4 / 21.5 tok/s (noise).
+- Downtime: three restart cycles, 9 m 07 s total (17:05:32->17:06:45, 17:12:07->17:13:21, 17:22:25->17:29:05 with the server down for the gate round). Server left UP on 8095, live config unchanged (md5 `1c89a63d`), `IK2_AT2S=1`, /v1/models 200.
+- Caveat banked: with `IK2_CPU_FRAC=0.5` greedy decode is NOT bit-reproducible (same 400-token prompt uncached gave three different continuations - the lane split is timing-driven). "Same prompt, same answer" is only a valid gate with `IK2_CPU_FRAC=0`. Pre-existing, not the cache.
+- Not done: full-layer K/V snapshots (the real repair for cross-conversation reuse); README/CHANGELOG entries; nothing pushed.
+### A2S at 100K: the deep win is 2.05x, and it grows with depth (2026-11-26, lab, branch lab-a2 @ 3846c36, measurement only)
+
+- Arms: 99,689-token prompt each (a 381,945-char harbour-operations log with a counter per block; needle paragraph at 77.9 pct depth), different opening line and needle code per arm so no prefix was shared, `cached_tokens: 0` on both. temp 0, max_tokens 128, non-stream, client timeout 3600 s, run detached.
+| arm | prompt_tokens | prefill | decode | request wall |
+|---|---|---|---|---|
+| ON `IK2_AT2S=1` | 99,689 | 1,070.3 s, 93.1 tok/s | **83.02 ms/token, 12.0 tok/s** | 1,081.1 s |
+| OFF `IK2_AT2S=0` | 99,689 | 1,070.4 s, 93.1 tok/s | **170.48 ms/token, 5.9 tok/s** | 1,092.3 s |
+- Delta: **2.054x decode rate, 87.45 ms/token removed = 51.3 pct of the OFF token**. Prefill delta 0.009 pct (noise) - prefill is untouched by design.
+- Orchestrator cross-check from the server log itself (`done:` lines): `17:53:23 done: 128 tokens in 1081 s (12.0 tok/s)` and `18:13:08 done: 128 tokens in 1092 s (5.9 tok/s)`; with the 1,070 s prefill on both sides the decode portions are ~10.7 s vs ~21.6 s for 128 tokens = 83 vs 169 ms/token. The fixer's ms/token figures are reproduced from the log alone.
+- Depth trend measured so far: shallow **+3.23 pct** -> 20,753 tok 84.63 -> 62.14 ms (1.362x) -> 99,689 tok 170.48 -> 83.02 ms (**2.054x**). The win does not fade: the end-to-end ratio approaches the kernel's 3.26x as attention's share of the token goes to 1. Implied split at 100K, if the kernel ratio holds: attention ~126 ms of the OFF token (74 pct) and ~38.7 ms of the ON token, leaving a ~44 ms non-attention floor (expert streaming/MoE). That 74 pct is higher than the ISA audit's 49 pct - the two cannot be separated without a profiler run at depth (not done; no code change was allowed).
+- Needle recall: both arms quoted their OWN code verbatim in the reasoning (`4815-ALPHA-77` ON, `9062-OMEGA-31` OFF); `content` was empty because the 128-token budget went to thinking. Incidental live confirmation that the 3846c36 cache fix holds at 100K (no cross-arm bleed).
+- Serving fact of its own: deep prefill is **93.1 tok/s at 99.7K (17 min 50 s per request)** vs 297 tok/s at 20.6K - the prefill cliff is unchanged by AT2S and is now the dominant cost of a deep request.
+- Downtime 3 m 44 s (three restart cycles: 74 s / 76 s / 74 s). Config restored byte-identical (md5 `1c89a63d1c22161c70e4b782cceeccf9`), `IK2_AT2S=1` in force, `/v1/models` 200, one short completion `'DONE'` with no long-prompt content, no stray processes.
+- Deviations: prompt is 99,689 tokens (not exactly 100,000); needle answers landed in `reasoning_content`; the watchdog defaults to 90 s (not 180) and only fires on an engine that is silent AND idle, so it would not have tripped a working prefill - `MAYA_ENGINE_STALL_S=3600` and `MAYA_REQUEST_QUIET_S=3600` were exported on the arm command lines only and are unset in the final server.
+### A0 fp16 scores: the deep prefill win is 1.50x (2026-11-26, lab, branch lab-a2 @ b7ddd79)
+
+Gate `IK2_SCFP16=1` (default off) stores the attention score buffer as fp16 instead of fp32, doubling `lg_cap` slots at the same byte budget. Committed `b7ddd79` (4 files: main.cu lg_score_cap/sc_type/sc_ptr/dispatch, kernels templated probs, parity tests).
+
+Depth trend (same binary, CLI, --gen 1, live knobs):
+| prompt | OFF | ON | delta |
+|---|---|---|---|
+| 20,607 | 273.5 / 273.3 tok/s | 289.4 / 289.1 | +5.4 pct |
+| 40,000 | 216.2 | 247.2 | +14.4 pct |
+| 99,674 | 1064.98 s / 93.6 tok/s | 710.10 s / 140.4 tok/s | -33.3 pct wall, +50.0 pct |
+
+Provenance (engine lines, back-to-back GPU-exclusive, 19:37-20:07): `prompt: 99674 tokens in 1064.98 s (93.6 tok/s)` vs `prompt: 99674 tokens in 710.10 s (140.4 tok/s)`. OFF reproduces the server-side 93.1.
+
+MECHANISM (why super-linear): `Tq = lg_cap / (H * nk_ub)` so `Tq ∝ 1/nk`; blocks per pass `∝ nk`; the prefix fp8->f16 unpack runs ONCE PER BLOCK (`main.cu:1992-2008`) and is O(nk) per block => O(nk^2) unpack traffic per pass. Halving Tq halves that quadratic term as well as the score bytes and doubles tile fill. At 20.6k the GEMMs dominate; at 100k the unpack dominates. The gate therefore does part of A2's job (the per-block re-unpack) for free.
+
+Tq proof (IK2_SCFP16_LOG): 8192 pass 341 -> 512 (25 -> 16 blocks); 40k deepest chunk 69 -> 139 (16 -> 8); 100k Tq 28 -> 56, blocks 49 -> 25.
+
+AUDIT CORRECTIONS (authoritative over the earlier scoping report):
+- `lg_cap` is floored by `64 << 20` => 67,108,864 score slots = 256 MiB, NOT 28,360,704 / 113.4 MB. So Tq at 102,020 keys is 27 -> 54, not 11 -> 22, and cuBLAS' 32-wide n-tile was already 84 pct full at 27 - the 'tile starvation' argument was void.
+- `kRelbRows = 512` pins Tq in BOTH modes for nk <= ~10.9k, so 8k/20.6k arms are structurally blind to this gate.
+- The 256-query refill path is DEAD on this model (W.T_sup = 0 because c.n_pass == 3, main.cu:6790; big_begin early-returns :5109).
+
+QUALITY PRICE (labelled loss, prefill path only; `--score --chunk 512`, 511 positions): NLL 2.757829 -> 2.771214 (+0.0134, +0.49 pct), PPL 15.766 -> 15.978, 37/511 argmax flips (7.2 pct), mean |dlp| 0.101 (max 1.99), top-32 overlap 0.94 (min 0.72). Greedy 40 @65 changes de1aa7db -> ba9cde27. Note `--score --chunk 1` cannot see the gate (T=1 runs the decode path).
+
+Gates: build clean; ik2_kernels_test 835 checks all passed (gate on and off) incl. new fp16-vs-fp32 parity cases; default-off identity exact (greedy de1aa7dbdeb2be5a, score payload 1c874e32e7023ab4, NLL 2.754963); decode flat (62.8 ms/token both arms at 20.6k).
+
+Deviations: 100k arm ran as CLI ids (99,674) vs the earlier server prompt (99,689, +15 template tokens); IK2_SCFP16_LOG on for both arms (identical overhead); second arm had warm page cache (load outside prompt_s). A first cut using __half2float(uint16_t) converted the integer rather than the bits (NLL 12.65) - fixed to h2f(), parity test added.
+
+Downtime 31 min 52 s. Server restored UP on 8095 from the untouched live config (md5 1c89a63d1c22161c70e4b782cceeccf9), IK2_AT2S=1, ROOM_MB 256, no IK2_SCFP16.
+### Score budget sizing: 512 MiB buys +29.5 pct deep prefill at zero deep-decode cost (2026-11-26, lab, branch lab-a2 @ 0b2ee38)
+
+- Mechanism recap: `Tq = lg_cap / (H * nk_ub)`. At 100k keys, every MiB of score budget is ~0.22 queries of Tq, and Tq sets how many query blocks re-run per prefill pass. cuBLAS runs the same QK/PV products about twice as fast per FLOP at n=56 as at n=28, so raising Tq is the deep-prefill lever (A0 proved it at 28 -> 56).
+- Gate generalized in `0b2ee38` (src/ik2/ik2_main.cu +22/-13): `IK2_SC_MB=<MiB>` sizes `lg_cap = MiB*1048576/sizeof(score)`; `IK2_SC512=1` kept as an alias for 512; unset = the 64 Mi score floor (256 MiB). Banner names both buffers.
+- VRAM accounting (measured, not assumed): `lg16` aliases `gu32`; `gu32_bytes = 4*max(..., (lg_cap+1)/2)` so the lg16 term is `2*lg_cap` bytes. **The MiB asked for is allocated twice** (lg + lg16), so 512 MiB costs ~1 GiB, and the tier pays for it.
+
+| budget | prefill 99,674 | tok/s | Tq | blocks/pass | tier | expert bytes | gain | tier cost |
+|---|---|---|---|---|---|---|---|---|
+| unset (256 MiB) | 710.51 s | 140.3 | 56 | 25 | 631 slots / 2.5 GiB | 319.7 GiB | - | - |
+| 384 MiB | 599.00 s | 166.4 | 84 | 17 | 564 / 2.2 GiB | 341.2 GiB | -15.7 pct / +18.6 pct | -10.6 pct |
+| 512 MiB | 548.49 s | 181.7 | 112 | 13 | 501 / 2.0 GiB | 364.6 GiB | -22.8 pct / +29.5 pct | -20.6 pct |
+
+- 384 MiB buys 69 pct of the gain for 51 pct of the tier. Not saturated at n=112: the deeper the prompt, the bigger the share of the win (40k was only +8.0 pct at 512).
+- 40k prompt: off 161.67 s (247.4) / 512 MiB 149.69 s (267.2), Tq 139 -> 279.
+- Caps verified (main.cu:2012-2013): `Tq = max(1, min(T-ts, lg_cap/(H*nk_ub)))`, then `min(Tq, kRelbRows=512)` only when `W.relb` is set, so it does not bind at depth; at 8,192 keys `kRelbRows` pins Tq=512 in both modes, which is why an 8k arm cannot see the change.
+
+DECODE, the deciding measurement (fresh process, same 99,674-token prompt, --gen 128, IK2_AT2S=1):
+| arm | prefill | generation | ms/token | decode misses |
+|---|---|---|---|---|
+| unset | 710.73 s | 127 tokens in 10.64 s (11.93 tok/s) | 83.78 | 2,649 |
+| 512 MiB | 548.66 s | 127 tokens in 10.65 s (11.92 tok/s) | 83.86 | 3,397 |
+- +0.10 pct = flat; the 128-token outputs are token-identical. The tier loss (+28 pct decode misses, 631 -> 501 slots) does not reach the deep decode critical path. Earlier shallow check: 62.83 -> 63.23 ms/token (+0.6 pct).
+- Quality: the budget is numerically neutral. `--score --chunk 512` payload sha `9556e260ddaf880b`, NLL 2.771214, PPL 15.978023 identical at 256/384/512; first greedy token at depth `3256` in all three arms. It adds nothing to the fp16-score price (2.757829 -> 2.771214, 37/511 flips, top-32 0.94).
+
+GATES: build clean; `ik2_kernels_test` all passed unset / IK2_SC512=1 / IK2_SC_MB=384; unset identity greedy `de1aa7dbdeb2be5a`, `--score --chunk 1` `1c874e32e7023ab4`, NLL 2.754963.
+
+CAVEATS
+- `--chunk 8192` with >=512 MiB OOMs at load (`cudaMalloc` in ik2_main.cu:452, before tier planning). The served config runs the default `--chunk 2048`, which loads comfortably.
+- Back-to-back process loads briefly hit `expert cache: no slot free (slots 16, ...)` while the previous process's VRAM was not yet reclaimed: the tier is planned from free VRAM with little slack. Script artifact, but it is the same latent pool-floor-8 death we know.
+- A0 record correction: the fp16-score ON-mode greedy sha is `5c2fb58926bb5035` (3 stable runs), not `ba9cde27`, which predated the fp16-load fix in that session.
+- nvcc is not byte-reproducible on this lab: identical source rebuilt to md5 `d6bcac25` vs the serving `50179d9d`. Binary hashes are not an identity gate here; behavioural gates (greedy sha, score payload sha) are.
+
+DECISION: enabled 512 MiB on the lab (user). Config env gains `IK2_SC_MB=512`, backup `maya-inkling-2-mini-lab.json.bak-pre-scmb512`, config md5 `1c89a63d...`/`1af46daf...` -> `9f7c57ef86bf236009331fff6ac52230`; server restarted (SIGTERM 51 s drain, ready 22 s), engine env verified `IK2_SC_MB=512, IK2_SCFP16=1, IK2_AT2S=1, IK2_ROOM_MB=256, IK2_CPU_FRAC=0.5`. Lab deep prefill is now ~9 m 09 s per 100K prompt (was 17 m 45 s before A0, 11 m 50 s after).
+### Chunk sweep and the deep-token profile: 4096 is +3.7 pct prefill, and the expert floor is launch-bound (2026-11-26, lab, branch lab-a2 @ 0b2ee38)
+
+Enablement proof for `IK2_SC_MB=512` (the `--serve` mode prints no budget banner): a live 99,700-token request prefilled in ~562.5 s (~177.3 tok/s, vs 181.7 CLI) and decoded 128 tokens in ~10.5 s (~82.0 ms/token). Both match the 512 MiB expectation, so the budget is in force. That request's answer was empty (`finish=length`, content '') because the 128-token cap went to the reasoning trace; the timing, not the content, is the proof.
+
+CHUNK SWEEP, 99,674 tokens, shipped env (`IK2_SCFP16=1`, `IK2_SC_MB=512`), GPU-exclusive CLI:
+| `--chunk` | prefill | tok/s | Tq | blocks/pass | tier | expert bytes | misses |
+|---|---|---|---|---|---|---|---|
+| 1024 | 605.45 s | 164.6 | 112 | 4 (last T=346) | 617 / 2.4 GiB | 600.5 GiB | 160,468 |
+| 2048 (shipped) | 548.64 s | 181.7 | 112 | 13 | 501 / 2.0 GiB | 364.6 GiB | 96,686 |
+| 3072 | 539.93 s | 184.6 | 112 | 13 | 419 / 1.7 GiB | 279.8 GiB | 74,009 |
+| **4096** | **528.23 s** | **188.7** | 112 | 13 | 307 / 1.2 GiB | 246.2 GiB | 64,731 |
+- 4096 is **+3.7 pct** over the shipped 2048; 1024 is âˆ’10.4 pct. Control reproduced 548.49 s â†’ 548.64 s (0.03 pct).
+- Tq is identical (112) in every arm, so this isolates per-pass overhead, and the mechanism is expert traffic: larger chunks mean fewer passes and far fewer expert copies (364.6 â†’ 246.2 GiB), which outweighs the tier shrink 501 â†’ 307 (a chunk sets `Tm`, so the pass scratch eats the tier).
+- 4096 loads fine at chunk 4096; the OOM boundary is 8192 with the 1 GiB of score buffers.
+
+DEEP-TOKEN PROFILE (nsys `--trace=cuda --delay 600 --duration 60` over `--gen 1200`; the window was verified 100 pct decode via 706 LM-head instances; a first capture that mixed prefill tail was discarded):
+| where | ms/token | pct | launches/token |
+|---|---|---|---|
+| attention (A2S split + combine + attn_res + prep_qkv) | 32.23 | 37.9 | 288 |
+| expert kernels (gate/up/swiglu + down + weight decode) | 27.84 | 32.8 | 117 |
+| LM head (`mv_blocks<8,2>`) | 6.82 | 8.0 | 1 |
+| dense projections (qkv/wo/router/out) | 10.38 | 12.2 | 345 |
+| routing/loop gates/tail/conv/rms/combine | 4.06 | 4.8 | 579 |
+| kernels total | 81.33 | 95.7 | 1332 |
+| gap (wall âˆ’ kernels) | 3.65 | 4.3 | â€” |
+- Host launch API is 5.9 ms/token (940,439 `cudaLaunchKernel` in 60 s) but fully hidden behind 50.8 s of `cudaStreamSynchronize`: the host waits on the GPU.
+- **Verdict: launch/occupancy-bound.** Expert picks run at 72.5 Âµs a pick for 11.3 MFLOP and ~2.9 MB of weights = 156 GFLOPS (2.3 pct of peak) and 40 GB/s (20 pct of HBM), across 117 launches of ~6.5 picks each, ~250 Âµs apiece. Attention A2S is ~20 GB/s and ~60 GFLOPS. Only the LM head approaches a roofline (36 GB/s, 18 pct of HBM). GPU busy 95.7 pct, so the 4.3 pct idle is launch ramp (1332 Ã— ~2.7 Âµs).
+- Therefore slot-batching (32 slots a launch) should roughly halve the expert floor â‰ˆ âˆ’14 ms/token (âˆ’16 pct of the deep token) â€” the largest remaining item outside attention. Kernel-driven row tables alone are worth ~3-4 ms (the size of the gap) unless they also remove the per-visit routing D2H.
+
+Deviations: the verification answer was empty (reasoning ate the 128-token budget); the first nsys window mixed 13.7 s of prefill tail and was re-run; no build this round (so the kernels-test gate is vacuous); tree clean at `0b2ee38`, server restored on the live config (md5 `9f7c57ef`), no `--chunk` in the config, downtime 63 m 43 s.
+### Slot batching: not applicable, and chunk 4096 is free on decode (2026-11-27, lab, branch lab-a2 @ 0b2ee38)
+
+SLOT BATCHING (`IK2_SLOTB`) WAS NOT BUILT â€” the premise was falsified before any code:
+- The 117 expert launches are already per-visit batches: 48 visits/token, ~58 gate_up + ~59 down, ~1.2 launches a visit, 6.5 picks each. Grid is `(F/(WARPS*ROWS)) x picks` (kernels.cu:7867) = ~103 x 6.5 = **670 blocks per launch = 45 waves across the 15 SMs**. The launch is not starved; more rows cannot buy occupancy.
+- The total prize for cutting launches is the measured inter-kernel gap: **3.65 ms/token = 4.3 pct**. GPU busy 95.7 pct.
+- A 32-slot batch cannot be constructed at T=1: only a visit's K=8 picks share an input vector, and visits are strictly sequential (layer L+1's hidden is layer L's MoE output).
+- Per-row cost is weight decode + dot, not input traffic: `IK2_XGLOBAL=0` (stages `x` in shared once per block) is 0.5 pct SLOWER (15.79/15.77/15.78 vs 15.86/15.87/15.85 tok/s, 3 rounds, bit-identical).
+- The floor is a 1-token GEMV chain: 384 picks x ~2.9 MB = ~1.13 GB of expert weights per token in 27.84 ms = 41 GB/s (20 pct of HBM) at 2.3 pct of FLOP peak. PolyStrata's 32-slot trick pays where many rows are in flight; T=1 has no more rows to give.
+- Next decode targets, in order: attention (32.2 ms) then the dense projections (10.4 ms across 345 launches of ~34 us GEMVs).
+
+CHUNK 4096 IS FREE ON DEEP DECODE (99,674 tokens, shipped env, `IK2_AT2S=1`, `--gen 128`):
+| `--chunk` | prefill | tok/s | decode | ms/token | tier | decode misses |
+|---|---|---|---|---|---|---|
+| 2048 | 548.42 s | 181.7 | 10.63 s | 83.70 | 501 / 2.0 GiB | 3,396 |
+| **4096** | **527.90 s** | **188.8** | 10.65 s | 83.86 | 307 / 1.2 GiB | 5,634 |
+- Prefill âˆ’20.5 s (âˆ’3.7 pct), decode +0.16 ms/token (+0.2 pct, noise), generated tokens identical. The tier falls 501 -> 307 and decode misses rise 66 pct, yet decode does not care â€” the extra misses overlap compute. Reproduced twice (528.23 s in the sweep, 527.90 s here).
+- ENABLED: config `args` now `--model ... --max-context 131072 --drafting off --chunk 4096`, backup `maya-inkling-2-mini-lab.json.bak-pre-chunk4096`, config md5 `9f7c57ef...` -> **`43b9530064da3ed6384024acd328053d`**. Server stopped 51 s, ready 22 s, engine cmdline verified, `/v1/models` 200, live completion `'OK'`, GPU 7889/216 MiB.
+
+Gates (third attempt, after two invalidated by stale exported env): greedy `de1aa7dbdeb2be5a`, `--score --chunk 1` payload `1c874e32e7023ab4`, NLL 2.754963. Tree clean at `0b2ee38`, no build this round, downtime 36 min 18 s.
+
+Lab state now: 100K request = ~528 s prefill (188.8 tok/s) + 83.9 ms/token decode (11.9 tok/s), i.e. ~9 m 30 s to first useful token at 100K.
+### Dense-projection batching: null result, the big matrices are already at 85 pct of HBM (2026-11-27, lab, branch lab-a2 @ 0b2ee38)
+
+No code shipped. The row-pairing kernel (`mv_q8p2_kernel`, two rows a warp sharing one float4 `x` load, bit-exact) measured **0.2 pct SLOWER**, so it was reverted per the stop rule; the descriptor fusion was not built because its ceiling was measured at ~0.6 pct before any code.
+
+Launch inventory (706-token pure-decode nsys window, per token):
+| kernel | launches | ms | us each |
+|---|---|---|---|
+| `mv_q8p_kernel<4>` - q, k, v, r, gate, wo | 185.3 | 6.36 | 34.3 |
+| `gemv2T` (cuBLAS; router, loop gates) | 112.2 | 1.28 | 11.4 |
+| `mv_blocks_kernel<4,2>` | 24.0 | 2.15 | 89.4 |
+| `mv_blocks_kernel<2,1>` | 14.0 | 0.29 | 20.9 |
+| `mv_blocks_kernel<4,1>` | 9.0 | 0.20 | 23.0 |
+| `mv_blocks_kernel<8,2>` (LM head, untouched) | 1.0 | 6.82 | 6817 |
+| dense total excl. head | 344.5 | 10.28 | |
+
+Per visit (48/token): ~3.9 `mv_q8p` + ~2.3 `gemv2T` + ~1 `mv_blocks` = ~7 launches / 214 us.
+
+WHY IT CLOSED:
+- Largest matrix (wq/wgate 2304x2304 Q8 = 5.6 MB) takes 34.3 us => **163 GB/s = 85 pct of HBM peak**. At the roofline; nothing to win.
+- The same launch also re-reads `x` (21 MB vs 5.6 MB of weights) but `x` is 9.2 KB and L2-resident: the pairing kernel halved those reads and changed **nothing** (even 0.2 pct slower) â€” L2 was never the limiter.
+- Only slack: small matrices (wk/wv 1.9 MB => 55 GB/s, 2 of 7 launches) and the launch ramp, whose entire budget is the measured 3.65 ms/token inter-kernel gap. A 5->1 descriptor fusion of the per-visit projections (192 of 345 launches) can reach only a fraction of that = **<= 0.6 pct**.
+- `mv_blocks` (47 launches, 2.6 ms) already shares `x` across ROWS inside a warp (`row_dot_2`) â€” it is the already-done version of this idea, and runs at 25-40 GB/s only because its matrices are small.
+
+GATES (on the corrected build; a first build had a template-placement error and ran a stale binary â€” nothing from it used):
+- `ik2_kernels_test` all passed, gate unset and `IK2_DPB=1`.
+- Identity OFF: greedy `de1aa7dbdeb2be5a`, score payload `1c874e32e7023ab4`, NLL 2.754963. Identity ON: identical, 511 positions, 0 top-1 divergences, max |dlp| exactly 0.
+- Speed, prompt65 `--gen 256`, 6 rotated interleaved rounds: OFF median 14.105 s (18.08 tok/s) vs ON 14.135 s (18.05); five of six paired deltas negative. Secondary 20.6k arm `--gen 128`: 7.98 vs 8.01 s, prefill 75.27 vs 75.32 s â€” same -0.4 pct direction.
+
+State: no commit, tree clean at `0b2ee38`, identity re-verified on the rebuilt binary; server UP on 8095 (ready 21 s, `/v1/models` 200, `content='OK'`), config md5 `43b9530064da3ed6384024acd328053d` unchanged, no `IK2_DPB`, `--chunk 4096` in force, GPU 7891 MiB / 0 pct. Downtime 35 min 16 s.
+
+CONCLUSION FOR THE DECODE BUDGET: of the 83.9 ms deep token, attention 32.2 ms is the only item with real headroom; experts (27.8) are launch-saturated, dense (10.3) is at 85 pct of HBM on the matrices that matter, head (6.8) is one GEMV at 36 GB/s but only 8 pct of the token, and the gap floor is 3.65 ms.
+### Decode attention round 2: parallelism shut, the 8 full-layer visits are a per-key serial chain (2026-11-27, lab, branch lab-a2 @ 0b2ee38)
+
+DECOMPOSITION (40,000-token context, 872-token pure-decode window, 68.81 ms/token, live knobs, IK2_AT2S=1):
+| family | launches/token | ms/token | us each |
+|---|---|---|---|
+| `attn_split_at2` total | 48.0 | 14.51 | 302 mixed |
+| - 40 sliding visits (1024 keys) | 40.0 | 3.11 | 77.8 |
+| - **8 full-attention visits** | **8.0** | **11.40** | **1425** |
+| `attn_res_vec4<0,512>` + `<1,512>` | 143.9 | 1.32 | 9.2 |
+| `attn_combine` | 48.0 | 0.38 | 7.9 |
+| `prep_qkv_r_fp8` | 48.0 | 0.22 | 4.6 |
+| family | 288 | 16.43 | |
+Scaled to 99.7k (full visits x 2.5 keys): 28.5 + 3.11 + 1.32 + 0.38 + 0.22 = ~33.5 ms, which reproduces the 32.23 ms measured => **the 8 full-layer split instances are 87 pct of the family at depth**, and nothing else in it is worth 1 ms.
+
+ROOFLINE VERDICT: a full instance at 40k moves 61.4 MB of fp8 K+V in 1425 us = 43 GB/s (17 pct of 256), 737 MFLOP = 517 GFLOPS (7.5 pct of 6.85 TF), ~11.5 M warp-instructions at 8.1e9/s (7 pct of 1.14e11). Neither roofline is close. It is a **per-key serial chain**: a 4-MAC lane dot, a 5-step warp reduction and two expf per key per head, R=3 heads a block = ~1.6 MAC per warp-instruction against 32 possible.
+
+THE ONE PLAUSIBLE LEVER, TESTED AND SHUT: `P = min(128, nk/64)` is at its cap for any context above ~8,192 keys, so a deep launch is 8 kv-heads x 128 = 1024 blocks and, at `__launch_bounds__(128,4)`, only 16 of an SM's 64 warps. `IK2_AT3=1` raised the cap to 512 (4096 blocks), decode path only. Measured at 40k, `--gen 128`, 3 OFF / 3 ON interleaved: OFF median 8.66 s = **68.2 ms/token**, ON 8.73 s = **68.7 ms/token** => **-0.8 pct (ON slower)**. 4x the blocks moved nothing: it is bound INSIDE the warp, not by launch parallelism. Reverted, no commit, tree clean at `0b2ee38`.
+
+A2S REFERENCE AT DEPTH: `IK2_AT2S=0` = 13.59 s = **107.0 ms/token** at 40k, so A2S is worth **-38.8 ms/token (-36 pct)** there â€” the family it replaced was far larger than what is left in it.
+
+GATES: build clean; `ik2_kernels_test` all passed unset and with `IK2_AT3=1`; identity OFF and ON both greedy `de1aa7dbdeb2be5a`, score payload `1c874e32e7023ab4`, NLL 2.754963. NOTE the `--score --chunk 1` gate is blind to this knob by construction (nk <= 512 => P <= 8 in both modes), which is why both matched; the depth arms' greedy streams were identical (`e3830cb138` in 5 of 6 runs, one OFF run differed `1c15a89ca9` from the known CPU-lane nondeterminism, and all three ON runs matched OFF).
+
+STATE: server UP on 8095, live config md5 `43b9530064da3ed6384024acd328053d` unchanged, no `IK2_AT3`, `--chunk 4096`, `/v1/models` 200, live completion `'OK'`, GPU 7891 MiB / 0 pct. Downtime 72 min 30 s.
+
+WHAT REMAINS, PRICED: not parallelism, not retiling â€” the 32-lane per-key dot with a warp reduction IS the algorithm at ~1.6 MAC/instr. Reaching it needs a **prefill-style key x head tile kernel for the 8 full layers only** (fp8 K/V decoded into shared, matmul-shaped inner loop, changed online-softmax grouping) â€” a rewrite gated numerically like A2S, not a session's edit. Best case ~28.5 ms -> ~10 ms of an 83.9 ms deep token (~20 pct).
+### Full-layer tiled decode attention, attempt 1 (AT4): 11 pct, not 25 â€” reverted, cause named (2026-11-27, lab, branch lab-a2 @ 0b2ee38)
+
+Design (as validated by arithmetic in the prior session): kill the per-key cross-lane reduction â€” Phase A lane-owns-a-key for the score dot (no shuffles in the loop), Phase B one xor-max + one sum per 32 keys per head, Phase C lane-owns-dims PV with the 3 heads sharing V reads. Predicted 129 -> ~38 warp-instructions per (key, head) and ~96x fewer serialized reductions => 1425 -> 600-700 us per full visit.
+
+Built: `attn_split_at4_kernel<KVT,R>` (+170 lines src/ik2/ik2_kernels.cu), gate `IK2_AT4=1` default OFF, dispatch `!kv4 && !kv4k && H%Hkv==0 && R<=4 && d_rel<=32 && window==(1<<30) && nk>=1024`; partials layout and `attn_combine_kernel` untouched; sliding visits and prefill excluded by construction. Tests +79 lines (`test_attn_decode_at4`, H=24/KV=8, nk 2500/5000, ring, f16+fp8).
+
+MEASURED (40k, --gen 128, live knobs, 3 OFF / 3 ON interleaved):
+| arm | median | ms/token |
+|---|---|---|
+| OFF | 8.64 s (14.69 tok/s) | 68.03 |
+| ON | 8.48 s (14.97 tok/s) | 66.77 |
+=> **-1.26 ms/token (-1.85 pct of the token) = -11.1 pct off the 11.40 ms full-visit total.** Prefill identical. Shallow control flat (14.16 vs 14.17 s; nk=65 < 1024 so the kernel never runs). In the 10-25 pct band => reverted, no commit, not enabled. Patch kept at `/tmp/at4-kernel.diff`.
+
+CORRECTNESS: the double-precision arbiter gives worst 0.01 of tolerance for BOTH at2 and at4, at 2500/5000 keys, ring path, f16 and fp8 â€” the new kernel is numerically as good. Depth greedy streams identical (`e3830cb138`). NOTE the `--score --chunk 4096` arm is BLIND here: it runs the prefill attention path, so it proves nothing about a decode-only kernel.
+
+WHY THE ARITHMETIC MISSED (named):
+1. Phase A's scattered reads: a warp-instruction now has 32 lanes reading 16 B each from 32 different 128-B key rows (768-B stride) => 32 sectors per instruction, ~2x sector traffic for the same useful bytes, 32 outstanding requests. at2 read one key's row contiguously (perfect coalescing).
+2. Phase C's serial tail: 32 sequential iterations per group, each with 3 shfl broadcasts per head and one 128-B V row â€” a dependency chain, where at2 processed 4 keys per warp iteration with K and V at the same offset and four warps interleaving.
+Conclusion: the kernel was NOT instruction-issue-bound; it is request/latency-bound, which an instruction count cannot see.
+
+NEXT ATTEMPT IF FUNDED (fixer's, agreed): same Phase A/B/C but stage the 32 keys through shared memory (32 x 128 B = 4 KB per warp, written scattered / read coalesced) and have Phase C take 2-4 keys per iteration with their V rows pre-staged â€” removes both new stalls while keeping the reduction win. Do NOT re-run the same kernel.
+
+Gate-OFF identity intact: greedy `de1aa7dbdeb2be5a`, `--score --chunk 1` `1c874e32e7023ab4`, NLL 2.754963. Tree clean at `0b2ee38`; server UP on 8095, config md5 `43b9530064da3ed6384024acd328053d`, no `IK2_AT4`, downtime 42 min 00 s.
+### Full-layer tiled decode attention, attempt 2: shared-memory staging is 9.7 pct SLOWER â€” the approach is closed (2026-11-27, lab, branch lab-a2 @ 0b2ee38)
+
+The fp8 fault was a one-liner: `v_load4<uint8_t>`'s fast path is `__ldg` (global pointers only) and the staged branch handed it a SHARED pointer. Fixed with a shared-safe reader used in the staged path only (`k_load4_sh`, plain dereference + the same `e4m3fnx2_to_f2` decode); `v_load4` untouched. Tile, 144-B stride, 16-B cooperative store and the 4-key Phase C all kept.
+
+Tests (both gate states): `ok at4: 2500 keys (f16/fp8) 0.01 | 5000 keys 0.01 | ring path 0.01` -> all passed. The fp8 fault is gone; the kernel is numerically correct in every case.
+
+| 40k, --gen 128, live knobs | OFF (at2) | ON (staged at4) |
+|---|---|---|
+| rounds | 8.65 / 8.63 / 8.63 s | 9.47 / 9.50 / 9.45 s |
+| median | **8.63 s = 67.95 ms/token** | **9.47 s = 74.57 ms/token** |
+- ON is +6.6 ms/token = **-9.7 pct against at2**; the 8 full visits go 11.40 -> ~17.9 ms/token (+57 pct).
+- Token streams identical `e3830cb138` in all six runs. Shallow control flat (nk=65 never reaches the kernel). Gate-OFF identity exact: greedy `de1aa7dbdeb2be5a`, score `1c874e32e7023ab4`, NLL 2.754963.
+
+| variant | full-visit attention | vs at2 |
+|---|---|---|
+| at2 (live) | 11.40 ms | â€” |
+| unstaged at4 | **10.14 ms** | **-11.1 pct** (best measured, never shipped) |
+| staged at4 | ~17.9 ms | +57 pct |
+
+WHY STAGING LOSES, and why this closes the approach rather than the implementation: the tile buys coalescing but costs **26,592 B of static shared per block = 3 blocks/SM = 12 warps of 64, against at2's 4 blocks/16 warps** â€” 25 pct of the resident warps â€” plus ~70 extra instructions per 32-key group (8 cooperative loads, 8 16-B shared stores, a `__syncwarp()`, 32 shared reads at a 4-way bank conflict). In a stall-bound kernel the warps ARE the resource: spending a quarter of them to fix a request pattern that the stall was not caused by cannot pay. Any future attempt at these 8 visits must not use shared staging.
+
+State: no commit, tree clean at `0b2ee38`, kernel and test reverted and rebuilt, identity re-gated exact. Patch kept outside git at `/tmp/at4-smem.diff` (17,477 B) alongside `/tmp/at4-kernel.diff`. Server UP on 8095, `/v1/models` 200, `content='OK'`, env `IK2_AT2S=1 IK2_SCFP16=1 IK2_SC_MB=512`, no `IK2_AT4`, `--chunk 4096`, config md5 `43b9530064da3ed6384024acd328053d`, GPU 7891 MiB. Downtime 34 min 8 s.
+
+DECODE ATTENTION IS CLOSED: 28.5 ms of the 83.9 ms deep token, warp/latency-bound, best available change = the unstaged at4 at -11.1 pct (-3.2 ms, ~3.8 pct of the token), not in the tree. Four attempts, three measured outcomes, one approach eliminated with a number.
+### Knob predicate: corrected, gated `IK2_KNOB_CHEAP`, default OFF (2026-11-27, lab, branch lab-a2 @ d77e58b)
+
+THE DEFECT (found in the CPU-lane quality gate, 2026-11-25): `IK2_CACHE_BIAS` and `IK2_TAIL_SKIP` test RESIDENCY as a proxy for "cheap to compute". With a CPU lane present a lane-served miss is never resident yet costs no fetch, so the bias steered toward stale residents and tail-skip dropped picks the lane would have computed free. At `IK2_CPU_FRAC=1.0` that was +0.144 NLL and 21 pct top-1 flips with `score cache: 0.00 GiB copied`.
+
+THE FIX (commit `8a53ba7`, then gated by `d77e58b`): `Layer` gains `cheap_d/cheap_h`; `route_tables()` builds `cheap = resident OR lane-served`, mirroring the splitter exactly (misses sorted by expert id, first `ceil(share x n_miss)` go to the lane, using the splitter's own moving `g_cpu_share`). The bias rewrites `probs_k` from it; `tail_seed`, `tail_apply`'s keep test and `route_token_kernel`'s inline tail use `resid | cheap` (the weight-0 placeholder still prefers a genuinely resident expert). `IK2_CPU_FRAC=0` or no pool => `cheap == residency` => old behaviour exactly.
+
+GATE `IK2_KNOB_CHEAP` (default OFF, commit `d77e58b`): `cheap_d/cheap_h` are ALLOCATED ONLY UNDER THE GATE, so when off the call sites get `nullptr` and the kernels fall back to `resid_d` alone â€” no residency-shaped stand-in, no leftover cost. Banner only when on. Live config does not name it (md5 `43b9530064da3ed6384024acd328053d` unchanged).
+
+MEASURED (prompt65 `--gen 256`, live env, 6 rotated rounds; quality `--score prefill-tokens-512.txt --chunk 1`, 511 positions, lane-off reference 2.853193):
+
+| gate | tok/s median | mean NLL | top-1 flips vs lane-off |
+|---|---|---|---|
+| OFF (pre-fix predicate) | **18.15** (18.08-18.18) | 2.954453 | 96/511 = 18.8 pct |
+| ON (corrected) | 16.56 (16.44-16.58) | **2.900099** | 76/511 = 14.9 pct |
+
+ON is **8.76 pct SLOWER** and buys **-0.054 NLL** (previous round: -0.037, flips 19.8 -> 15.7 pct; the split feedback is timing-driven so the digit does not reproduce, and the doc records both rounds).
+
+WHY IT CANNOT PAY: at `CPU_FRAC=1.0` the lane serves nearly every miss, so under the corrected predicate the bias correctly goes to ~0 and tail-skip stops dropping â€” that is the arm that measured 16.3-16.6 tok/s because the lane saturates. And the lane cannot be widened: **`IK2_LANE_THREADS` is NOT the CPU_FRAC lane's knob** (it sizes the `IK2_LANE` parity server, which is off here â€” a probe at `IK2_LANE_THREADS=8` still shows `CPU lane: 7 threads`); the real pool is `--threads - 1` = 7 workers on an 8-thread/4-core box, already the ceiling.
+
+VERDICT: the fix is correct and shipped behind a default-off gate; the live arm (CPU_FRAC 0.5 + code defaults bias 0.15 / tail 4) stays because it is 8.8 pct faster with 0.05 worse NLL. The gate is for anyone who wants quality-first with a heavy CPU lane.
+
+Gates: build clean; `ik2_kernels_test` all passed both gate states; identity with gate OFF exact (greedy `de1aa7dbdeb2be5a`, score `1c874e32e7023ab4`, NLL 2.754963). Downtime 14 min 37 s; server UP on 8095, `/v1/models` 200, completion `content='OK'`, GPU 7891 MiB.
+### Prefill profile: the PV GEMM is the anomaly, and the budget lever has not flattened (2026-11-27, lab, branch lab-a2 @ d77e58b)
+
+PROFILE (nsys `/opt/cuda-12.8/bin/nsys`, 99,673 tokens, `--gen 1`, chunk 4096, `IK2_SCFP16=1`, `IK2_SC_MB=512`; profiled run 530.52 s = +0.6 pct over 527.47 s so it is usable; 1,075,362 launches):
+
+| phase | total s | share |
+|---|---|---|
+| attention | **308.0** | **58.3 pct** |
+| experts | 149.8 | 28.3 pct |
+| dense (QKV/wo/router/loop gates) | 70.9 | 13.4 pct |
+
+Attention breakdown: PV GEMM 181.3 s (kernel `maxwell_sgemm_fp16_128x128_nn`, 171.74 s of it), QK GEMM 70.2 s (`maxwell_fp16_sgemm_fp16_128x128_tn`), `attn_probs_bias_f16_kernel` 38.36 s, `unpack_kv_fp8_to_f16_vec4` 13.86 s, bias GEMM 2.1, prep 1.1.
+
+THE ANOMALY: QK and PV do the SAME 269.1 TFLOP. QK runs at **3,833 GFLOPS (56 pct of peak)** with grid (4,8,3) = 96 blocks = 51 warps/SM; PV runs at **1,484 GFLOPS (21.7 pct)** with grid (1,4,3)-(1,8,3) = 12-24 blocks = 6-13 warps/SM. PV has N pinned at D = 128 (one N-tile), M = Tq = 112 tiled to 1-4 blocks, and K = nk serial and huge â€” a long-K/few-tile GEMM, which is the split-K case. Not bandwidth (score traffic 12 GB/s of 256). **Giving PV QK's geometry saves ~108 s = 20 pct of the run.** Experts already run at 4,735 GFLOPS (69 pct) and softmax at 110 GB/s (43 pct), so they have little headroom.
+
+ARITHMETIC CORRECTION: the model's work is ~1,334.9 TFLOP (attention QK+PV 2 x 269.1, bias 3.8, experts 609.5, dense 183.4) = **2.52 TFLOPS achieved = 36.9 pct of the 6.85 TFLOPS peak**. The earlier "563.6 TFLOP / 165 s at 50 pct" floor was wrong (it forgot the 48 layer VISITS vs 24 layers, i.e. the loop runs each token through 48 visits). True floor at 50 pct is **~390 s**; the 528 s run is at 74 pct of that, and the upside is ~1.35x overall, concentrated in PV.
+
+SCORE BUDGET SWEEP (same prompt, back-to-back):
+
+| `IK2_SC_MB` | prefill s | tok/s | Tq at 99.7k | tier | copied |
+|---|---|---|---|---|---|
+| 512 (control) | 527.47 | 189.0 | 112 | 307 | 246.2 GiB |
+| 640 | 496.07 | 200.9 | 140 | 245 | 265.0 GiB |
+| **768** | **466.50** | **213.7** | 168 | 182 | 283.3 GiB |
+
+Each 128 MiB buys 5.95 pct (0.0465 pct a MiB), identical at both steps â€” the lever has NOT flattened in this range. Decode check at 20,607 tokens, `--gen 128`: 63.07 -> 63.07 -> 63.23 ms/token, so 768 costs **+0.25 pct decode** at that depth (tier 307 -> 182 slots). Caveat: the decode check is at 20.6k; at >=40k the lost tier could bite and must be re-checked before 768 becomes permanent.
+
+VERDICT: `IK2_SC_MB=768` recommended (exact change: the env block, `"IK2_SC_MB": "768"`), and PV split-K is the remaining structural target (~108 s). Not enabled at capture time; config md5 unchanged. Downtime 48 min 41 s. Evidence at /tmp/ik2p-512.nsys-rep, /tmp/pref-{512,640,768}.log, /tmp/pref-dec-{512,640,768}.log.
+### Split-K PV GEMM: -112 s off every 100K prefill (2026-11-27, lab, branch lab-a2 @ c10bcb7)
+
+- The profile named PV as the anomaly: QK and PV move the same 269.1 TFLOP, but `maxwell_fp16_sgemm_fp16_128x128_tn` ran at 3,833 GFLOPS (56 pct) while `maxwell_sgemm_fp16_128x128_nn` ran at 1,484 GFLOPS (21.7 pct) for 171.74 s, because at Tq=112 the PV GEMM is M=128 (D), N=112 (Tq), K=nk (<=32,768 a chunk), batch 3 = **3 blocks** with a 100k-long K.
+- Attempt 1 (hand-written split-K GEMM, 256 threads, 64x128 tile, S in blockIdx.z) was numerically exact (6.2e-7 of full scale vs a host double reference) but **1.08 TFLOPS = 2.7x slower than cuBLAS**; reverted, not left as dead code.
+- Shipped design `IK2_PVSK=S` (commit c10bcb7, 5 files +202/-9, patch /tmp/pv-sk.patch, gate default off): keep cuBLAS, split K over S slices each on its own stream (one stream a (slice, KV group)), FP32 partials `S x kRelbRows(512) x HD(3072) x 4 B` = 6.29 MiB a slice (S=4 => 25.2 MiB, tier unchanged at 307 slots), then one reducer sums them into `W.o`. S=1 writes straight to the output (no partials).
+- Speed, 99,673 tokens, chunk 4096, SCFP16, SC_MB 512: off **527.96 s / 188.8 tok/s**; S=2 419.03 (237.9); **S=4 415.71 / 239.8 (-112.25 s, -21.3 pct)**; S=8 415.93 (no better than 4). PV implied 171.74 -> **59.49 s = 4,524 GFLOPS = 66 pct of peak** (65.4 pct of the GEMM removed).
+- Quality: `--score` over 4,096 tokens through the real prefill path, off 2.232597 / PPL 9.3241 vs S=4 2.235130 / 9.3477 = **+0.002533 NLL (+0.11 pct), 0/4095 next-token flips**, max |dlp| 3.839 (median 0.05, p99 0.83) from router near-ties across the 48 visits. 40k greedy stream identical `e3830cb138` both ways. Not covered: end-to-end quality at nk~100k (no score at that size).
+- Gates: build clean; `ik2_kernels_test` all passed with the gate unset and at IK2_PVSK=4, including a new geometry case (H=24, KV=8, D=128, Tq=112, nk=2,500) within 2e-3 of the double reference (worst 6.2e-7) and S=1 vs S=4 agreement (5.5e-4); identity exact (greedy `de1aa7dbdeb2be5a`, `--score --chunk 1` payload `1c874e32e7023ab4`, NLL 2.754963).
+- Second job, the 768 MiB decode re-check at 40k: SC_MB 512 prefill 134.44 s / decode 67.95 ms a token / tier 307; 768 prefill 130.22 s / **68.19 ms a token (+0.35 pct)** / tier 182, tokens identical. So 768 is safe on decode at both 20.6k (+0.25 pct) and 40k; NOT enabled (user chose PVSK only).
+- Enabled on the lab: `IK2_PVSK=4` added to the config env (backup .bak-pre-pvsk), config md5 `43b9530064da3ed6384024acd328053d` -> **`44ed858625eccbbca48ca61d3c38d053`** (15 env keys), server restarted, engine env verified.
+- Served verification through the API: 33,637-token prompt 97 s prefill (347 tok/s); **100,837-token prompt, 427.1 s wall, 102 tokens, answered `HARBOUR-CHECK-41` verbatim** => prefill ~418.6 s = **241 tok/s** (was 528 s / 189 before PVSK, 1,065 s / 93.6 at the sprint's start). Decode ~83 ms a token, unchanged.
+- Deviations: `ncu` cannot profile this Pascal card, so the split was sized from nsys grid/occupancy plus wall clock; `IK2_PVSK` covers the fp8-KV prefill path only; downtime 74 min 26 s for the build/test window plus ~1 min for the enable restart.
